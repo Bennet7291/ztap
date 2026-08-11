@@ -1,0 +1,15 @@
+[workspace]
+members = ["core", "platform/windows", "platform/macos"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors  = ["Ztap Contributors"]
+# GPL-3.0-only, not MIT: the bundled built-in dictionary (core/dict/ztap.dict.txt)
+# merges data from rime-ice (https://github.com/iDvel/rime-ice), which is
+# GPL-3.0-only. That data is compiled directly into the ztap-core binary via
+# build.rs + include_bytes!, so the combined work is GPL-3.0-only throughout
+# the workspace. See core/dict/README.md for full provenance and the
+# per-source license breakdown.
+license  = "GPL-3.0-only"

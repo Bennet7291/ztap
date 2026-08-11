@@ -1,228 +1,118 @@
-# LLM Proxy on Cloudflare Workers
+# Ztap
 
-English | [日本語](README_ja.md)
+A lightweight, offline, zero-configuration Simplified Chinese pinyin input method.
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/blue-pen5805/llm-proxy-on-cloudflare-workers)
+## Project structure
 
-This is a serverless proxy built on [Cloudflare Workers](https://www.cloudflare.com/developer-platform/products/workers/) that integrates with multiple Large Language Model (LLM) APIs. Inspired by [LiteLLM](https://github.com/BerriAI/litellm).
-
-## Features
-
-- **Centralized API Key Management:** Manage all your LLM API keys in one place.
-- **Pass-through Endpoints:** Forward requests directly to any LLM API with minimal changes.
-  - Examples: `/openai/chat/completions`, `/google-ai-studio/v1beta/models/gemini-2.5-pro:generateContent`
-- **OpenAI-Compatible Endpoints:** Use standard OpenAI endpoints for seamless integration with existing tools and libraries.
-  - `/v1/chat/completions`
-  - `/v1/models`
-- **Cloudflare AI Gateway Integration:** Leverage [Cloudflare AI Gateway](https://www.cloudflare.com/developer-platform/products/ai-gateway/), including its [Universal Endpoint](https://developers.cloudflare.com/ai-gateway/providers/universal/), for logging, analytics, and other features.
-- **Global Round-Robin Key Rotation:** Consistency across all isolates using Cloudflare Durable Objects.
-- **API Key Selection via Path Parameter:** Explicitly select or rotate within a range of API keys using `/key/{index|range}/` in the URL path.
-
-```mermaid
-flowchart
-  A[USER] -->　B(LLM Proxy)
-  B --> C(Cloudflare AI Gateway)
-  B --> D
-  C --> D["LLM API (OpenAI, Google AI Studio, Anthropic ...)"]
+```
+ztap/
+├── core/                        # Platform-agnostic input engine
+│   ├── build.rs                 # Compiles dict/ztap.dict.txt into a bincode blob
+│   ├── dict/
+│   │   ├── ztap.dict.txt        # Merged dictionary source (see README.md below)
+│   │   └── README.md            # Dictionary provenance & license notes
+│   └── src/
+│       ├── lib.rs               # InputSession façade + module re-exports
+│       ├── pinyin.rs            # Syllable segmentation (DP over valid syllable set)
+│       ├── dictionary.rs        # Word list load & query (built-in + user)
+│       ├── ranking.rs           # Candidate scoring (corpus freq + user pref + length)
+│       ├── learning.rs          # User selection history, local persistence
+│       └── punctuation.rs       # ASCII → Chinese punctuation mapping
+│
+├── platform/
+│   ├── windows/                 # cdylib — Windows TSF IME DLL
+│   │   └── src/
+│   │       ├── lib.rs           # DLL entry points, COM class factory, TSF registration
+│   │       ├── tsf.rs           # ITfTextInputProcessor implementation
+│   │       └── candidate_window.rs  # Win32 + Direct2D + DirectWrite UI
+│   │
+│   └── macos/                   # [[bin]] — macOS InputMethodKit bundle executable
+│       ├── Info.plist           # Input-method bundle manifest (IMKServer keys)
+│       └── src/
+│           ├── main.rs          # Thin binary entry point
+│           ├── lib.rs           # IMKServer setup, AppKit run loop
+│           ├── input_method.rs  # IMKInputController subclass
+│           └── candidate_window.rs  # NSPanel + CoreText UI
+│
+├── LICENSE                      # GPL-3.0-only (see License section below)
+└── Cargo.toml                   # Workspace root
 ```
 
-## Supported Providers
+## Architecture
 
-| Name             | Chat Completions | Direct | AI Gateway Support | Pass-Through Routes | Environment Variable                         |
-| ---------------- | ---------------- | ------ | ------------------ | ------------------- | -------------------------------------------- |
-| OpenAI           | ✅               | ✅     | ✅                 | `openai`            | `OPENAI_API_KEY`                             |
-| Google AI Studio | ✅               | ✅     | ✅                 | `google-ai-studio`  | `GEMINI_API_KEY`                             |
-| Anthropic        | ✅               | ✅     | ✅                 | `anthropic`         | `ANTHROPIC_API_KEY`                          |
-| Cerebras         | ✅               | ❌     | ✅                 | `cerebras`          | `CEREBRAS_API_KEY`                           |
-| Cohere           | ✅               | ✅     | ✅                 | `cohere`            | `COHERE_API_KEY`                             |
-| DeepSeek         | ✅               | ✅     | ✅                 | `deepseek`          | `DEEPSEEK_API_KEY`                           |
-| Grok             | ✅               | ✅     | ✅                 | `grok`              | `GROK_API_KEY`                               |
-| Groq             | ✅               | ✅     | ✅                 | `groq`              | `GROQ_API_KEY`                               |
-| Mistral          | ✅               | ✅     | ✅                 | `mistral`           | `MISTRAL_API_KEY`                            |
-| Perplexity       | ✅               | ✅     | ✅                 | `perplexity`        | `PERPLEXITY_API_KEY`                         |
-| Azure OpenAI     | ❌               | ❌     | ❌                 | `azure-openai`      |                                              |
-| Vertex AI        | ❌               | ❌     | ❌                 | `google-vertex-ai`  |                                              |
-| Amazon Bedrock   | ❌               | ❌     | ❌                 | `aws-bedrock`       |                                              |
-| OpenRouter       | ✅               | ✅     | ✅                 | `openrouter`        | `OPENROUTER_API_KEY`                         |
-| Workers AI       | ✅               | ✅     | ✅                 | `workers-ai`        | `CLOUDFLARE_ACCOUNT_ID` `CLOUDFLARE_API_KEY` |
-| HuggingFace      | ❌               | ✅     | ✅                 | `huggingface`       | `HUGGINGFACE_API_KEY`                        |
-| Replicate        | ❌               | ✅     | ✅                 | `replicate`         | `REPLICATE_API_KEY`                          |
-| Ollama           | ✅               | ✅     | ❌                 | `ollama`            | `OLLAMA_API_KEY`                             |
-
-**Note**: Providers marked with ⚠️ have limited support for certain features (e.g., Tool Use, multimodal capabilities).
-
-## Prerequisites
-
-Before you begin, ensure you have the following installed:
-
-- **Node.js:** Version `22.12+` or later is required.
-  - Download from: [nodejs.org](https://nodejs.org/)
-  - Verify your version: Run `node -v` in your terminal.
-- **Cloudflare Account:** A Free Plan is probably sufficient to deploy this project.
-  - Sign up for free at: [cloudflare.com](https://www.cloudflare.com/)
-
-## Quick Start
-
-1. Clone this repository.
-2. Install dependencies: `npm install`
-3. Authenticate with Cloudflare: `npm run cf:login`
-4. Create configuration file: `cp config.example.jsonc config.jsonc`
-5. Edit `config.jsonc` with your API keys
-6. Deploy the Cloudflare Worker: `npm run deploy`
-7. Deploy secrets: `npm run secrets:deploy`
-
-For more detailed instructions, please refer to the [Initial Setup Guide](docs/initial-setup.md).
-
-## Environment Variables
-
-### Required:
-
-- `PROXY_API_KEY`: API key to authenticate requests to the LLM Proxy server. (Any string can be used)
-
-### Cloudflare AI Gateway (Optional)
-
-Set these if you are using the Cloudflare AI Gateway.
-
-- `CLOUDFLARE_ACCOUNT_ID`: Your Cloudflare account ID.
-- `AI_GATEWAY_NAME`: Name of your AI Gateway.
-- `CF_AIG_TOKEN`: (Optional) Authentication token for your AI Gateway.
-
-### Provider API Keys
-
-Set the API key(s) for each provider you intend to use. API keys can be a single string, a comma-separated string, or a JSON-formatted string array.
-
-### Custom OpenAI-Compatible Endpoints (Optional)
-
-You can add your own OpenAI-compatible endpoints by configuring the `CUSTOM_OPENAI_ENDPOINTS` array in `config.jsonc`.
-
-Example:
-
-```jsonc
-"CUSTOM_OPENAI_ENDPOINTS": [
-  {
-    "name": "my-custom-llm",
-    "baseUrl": "https://llm.example.com",
-    "apiKeys": ["your-api-key"],
-    "models": ["model-1", "model-2"] // Optional, pre-defined models list for /v1/models
-  }
-]
+```
+keyboard event
+      │
+      ▼
+platform layer  (TSF on Windows / InputMethodKit on macOS)
+      │  handles OS integration, text commit, UI display
+      ▼
+core layer
+      ├── pinyin      →  segment continuous pinyin into syllable paths
+      ├── dictionary  →  look up candidates by syllable sequence
+      ├── ranking     →  score and sort candidates
+      └── learning    →  record selections, persist user data locally
 ```
 
-Once configured, you can access the custom endpoint using its name as a pass-through route:
-
-- Pass-through: `https://your-worker-url/my-custom-llm/chat/completions`
-- OpenAI-Compatible: Use `my-custom-llm/<model-id>` as the model name in `/v1/chat/completions` (e.g., `my-custom-llm/model-1`).
-
-### Global Round-Robin Key Rotation (Optional)
-
-This feature ensures that API keys are rotated in a consistent round-robin order across all requests globally, using Cloudflare Durable Objects.
-
-- `ENABLE_GLOBAL_ROUND_ROBIN`: Set to `true` to enable this feature. (Default: `false`)
-
-> [!IMPORTANT]
-> Enabling this feature requires a Cloudflare account that supports Durable Objects.
-
-### Local Development
-
-When running locally with `npm run dev`, Wrangler automatically simulates Durable Objects.
-
-### API Key Selection via Path Parameter
-
-You can explicitly select an API key or a range for rotation by adding `/key/{index|range}/` to the start of the URL path. This bypasses the default global round-robin logic.
-
-- **Single Key:** `/key/0/v1/chat/completions` (Selects the 1st key)
-- **Range:** `/key/1-3/v1/chat/completions` (Selects a random key from index 1 to 3)
-- **Unspecified End:** `/key/2-/v1/chat/completions` (Selects a random key from index 2 to the end)
-- **Unspecified Start:** `/key/-4/v1/chat/completions` (Selects a random key from index 0 to 4)
-
-Note: Random selection within a range is stateless and uses a cryptographically secure random number generator (`crypto.randomInt`).
-
-## Usage Example
-
-Send requests to your deployed Cloudflare Worker URL with the appropriate route and API key.
-
-### OpenAI-Compatible Endpoints
-
-These endpoints are designed to be compatible with the OpenAI API.
-
-#### cURL
+## Building
 
 ```bash
-curl https://your-worker-url/v1/models \
-  -H "Authorization: Bearer $PROXY_API_KEY" \
-  -H "Content-Type: application/json"
+# Windows (run on Windows or via cross)
+cargo build -p ztap-windows --release
 ```
+Produces a `cdylib` (`ztap_windows.dll`) that must be registered as a TSF
+text service via `regsvr32` (which calls the `DllRegisterServer` export;
+see `platform/windows/src/lib.rs`).
 
 ```bash
-curl -X POST https://your-worker-url/v1/chat/completions \
-  -H "Authorization: Bearer $PROXY_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "openai/gpt-4o",
-    "messages": [{"role": "user", "content": "Hello, world!"}]
-  }'
+# macOS
+cargo build -p ztap-macos --release --target aarch64-apple-darwin
 ```
+Produces a `Ztap` binary (`[[bin]]` target, not a `cdylib` — InputMethodKit
+runs one long-lived process per input method rather than loading a plugin
+into each client). That binary, `platform/macos/Info.plist`, and an app
+icon need to be assembled by hand into a `Ztap.app` bundle
+(`Contents/MacOS/Ztap`, `Contents/Info.plist`, ...) and installed under
+`~/Library/Input Methods/` — there is no Xcode project or bundling script
+in this repository yet. See `platform/macos/src/lib.rs`'s module doc
+comment for the App Sandbox caveat that must be handled during that
+packaging step.
 
-#### Python (OpenAI SDK)
+**Neither platform target has been compiled or run** — see the
+`# WARNING: UNTESTED` module doc comment at the top of every file under
+`platform/windows/src/` and `platform/macos/src/` for what's been checked
+against each API's published documentation versus what still needs
+verification against a real compiler and a live client application.
+`ztap-core` (the platform-agnostic engine) has no such caveat and is fully
+tested (`cargo test -p ztap-core`).
 
-```Python
-from openai import OpenAI
+## Dictionary source
 
-client = OpenAI(
-    api_key="PROXY_API_KEY",
-    base_url="https://your-worker-url"
-)
-models = client.models.list()
-for model in models.data:
-    print(model.id)
-```
+The built-in word list merges two upstream corpora:
 
-```python
-from openai import OpenAI
+- [`rime/rime-luna-pinyin`](https://github.com/rime/rime-luna-pinyin)
+  (`luna_pinyin`) — single characters and a modest set of idioms/proper
+  nouns.
+- [`iDvel/rime-ice`](https://github.com/iDvel/rime-ice) (`cn_dicts/base`) —
+  supplies common multi-character words (你好, 中国, ...) that bare
+  `luna_pinyin` omits by design, since Rime's reference implementation
+  composes those at runtime from a grammar model `ztap-core`'s static
+  dictionary doesn't have.
 
-client = OpenAI(
-    api_key="PROXY_API_KEY",
-    base_url="https://your-worker-url"
-)
-response = client.chat.completions.create(
-    model: "google-ai-studio/gemini-2.5-pro",
-    messages: [{ "role": "user", "content": "Hello, world!" }],
-)
+Only the data from each is used; neither Rime nor `rime-ice`'s Lua/schema
+tooling is a runtime dependency. Full provenance, filtering, and the
+license implication below are documented in `core/dict/README.md`.
 
-print(response.choices[0].message.content)
-```
+## License
 
-### Pass-through Endpoints
+**GPL-3.0-only**, workspace-wide — see `LICENSE`. This is driven by the
+`rime-ice` dictionary data above, which is GPL-3.0-only and is compiled
+directly into the `ztap-core` binary; see `core/dict/README.md` for the
+full reasoning and for what changing this later would require.
 
-Forward requests directly to the LLM provider's API using these endpoints.
+## Design goals
 
-#### cURL
-
-```bash
-curl -X POST https://your-worker-url/openai/chat/completions \
-  -H "Authorization: Bearer $PROXY_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-4o",
-    "messages": [{"role": "user", "content": "Hello, world!"}]
-  }'
-```
-
-```bash
-curl -X POST https://your-worker-url/google-ai-studio/v1beta/models/gemini-2.5-pro:generateContent \
-  -H "Authorization: Bearer $PROXY_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "contents": [{"role": "user", "parts": [{"text": "Hello, world!"}]}]
-  }'
-```
-
-## Documentation
-
-For detailed architectural and design information, please refer to the [Design Documentation](docs/design/overview.md).
-
-## Known Issues and Limitations
-
-This project is under active development and has the following known issues and limitations:
-
-- **Incomplete Provider Support:** Not all LLM providers are fully supported. Some providers may have limited feature support or may not be supported at all.
+- **Single binary** — no runtime dependencies, no Electron, no WebView
+- **Offline** — no network access, no user account
+- **Zero configuration** — works immediately after installation
+- **Native UI** — candidate window drawn with platform APIs (Direct2D / CoreText)

@@ -1,0 +1,46 @@
+[package]
+name    = "ztap-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ztap-core = { path = "../../core" }
+
+# UNTESTED: this crate could not be compiled in the environment it was
+# written in (no Windows toolchain/SDK available — see tsf.rs's module doc
+# comment). Feature list below is believed correct based on windows-rs's
+# published docs as of writing, but has not been verified against an actual
+# `cargo build` on Windows. Double-check `cargo build -p ztap-windows`
+# output against this list and adjust as needed.
+windows = { version = "0.62", features = [
+    # TSF (Text Services Framework) COM interfaces
+    "Win32_UI_TextServices",
+    # COM plumbing TSF's interfaces are built on (IUnknown, CoCreateInstance, ...)
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    # Required to *implement* (not just consume) COM interfaces server-side —
+    # ZtapTextService implements ITfTextInputProcessor, ITfKeyEventSink, etc.
+    "implement",
+    # Win32 fundamentals: HRESULT, error types, HWND, POINT, RECT, ...
+    "Win32_Foundation",
+    # Registry access for DllRegisterServer / DllUnregisterServer
+    "Win32_System_Registry",
+    # LoadLibrary/GetProcAddress-adjacent + module handle for DllMain
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+    # Candidate window: native Win32 window + message loop
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    # Candidate window rendering: Direct2D + DirectWrite (see candidate_window.rs)
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi_Common",
+    # %APPDATA%\Ztap path resolution for the user dictionary / learning store
+    "Win32_UI_Shell",
+    "Win32_System_Com_StructuredStorage",
+] }
+
+[lib]
+crate-type = ["cdylib"]   # Windows IME is loaded as a DLL

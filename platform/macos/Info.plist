@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WARNING: UNTESTED / UNVERIFIED PLACEHOLDER VALUES.
+
+  This Info.plist was written without a macOS/Xcode environment to build
+  and validate it against. The *keys* below are the standard, documented
+  set every InputMethodKit-based IME's Info.plist needs (cross-checked
+  against Apple's own InputMethodKit sample code structure and the
+  IMKServer.h header's InputMethodConnectionName usage; see lib.rs's
+  module doc comment for citations). The *values* (bundle identifier,
+  bundle version, connection name) are placeholders specific to this
+  project and have not been validated by an actual build and launch
+  cycle. In particular:
+
+    * InputMethodConnectionName must exactly match the `name` argument
+      lib.rs::run passes to IMKServer's initializer (it reads this same
+      key at runtime), which it does here ("ZtapConnection"), but this
+      pairing has never been exercised end to end.
+    * CFBundleExecutable must exactly match the [[bin]] name in
+      Cargo.toml ("Ztap") and the actual compiled binary's filename inside
+      Ztap.app/Contents/MacOS/. Xcode/cargo-bundle tooling normally keeps
+      these in sync automatically; a manual `cargo build` plus manual
+      bundle assembly (no Xcode project exists in this repository yet)
+      must do so by hand.
+    * LSUIElement=true hides Ztap from the Dock and Cmd-Tab switcher,
+      appropriate for a background input method with no main window of
+      its own (only the candidate panel). This is a deliberate choice,
+      not an oversight, but is called out since an unexpected Dock icon
+      is a common first symptom of getting this key wrong.
+    * App Sandbox must be OFF for this bundle (see lib.rs's module doc
+      comment, point 1). There is no entitlements file in this
+      repository yet; one must be added as part of a real Xcode/codesign
+      packaging step, which is outside what `cargo build` alone produces.
+
+  See core/dict/README.md and the top-level README.md for this project's
+  license (GPL-3.0-only); NSHumanReadableCopyright below should be updated
+  to match before any real distribution.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+
+    <key>CFBundleExecutable</key>
+    <string>Ztap</string>
+
+    <key>CFBundleIdentifier</key>
+    <string>org.ztap.inputmethod</string>
+
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+
+    <key>CFBundleName</key>
+    <string>Ztap</string>
+
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <!-- Arbitrary four-character creator code. Historically required by
+         some bundle tooling, largely vestigial on modern macOS but kept
+         for compatibility with older validation tools. -->
+    <key>CFBundleSignature</key>
+    <string>Ztap</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+
+    <key>CFBundleVersion</key>
+    <string>1</string>
+
+    <!-- Hide from Dock/Cmd-Tab; see the top-of-file WARNING comment. -->
+    <key>LSUIElement</key>
+    <true/>
+
+    <!-- InputMethodKit-specific keys. -->
+
+    <!-- Must match the `name` argument passed to IMKServer's initializer
+         in lib.rs::run. -->
+    <key>InputMethodConnectionName</key>
+    <string>ZtapConnection</string>
+
+    <!-- The Objective-C class name IMKServer instantiates per client
+         session. Must match the #[name = "..."] given to
+         ZtapInputController's define_class! invocation in
+         input_method.rs. -->
+    <key>InputMethodServerControllerClass</key>
+    <string>ZtapInputController</string>
+
+    <key>InputMethodServerControllerVisible</key>
+    <true/>
+
+    <key>tsInputMethodIconFileKey</key>
+    <string>ZtapIcon</string>
+
+    <!-- Describes the input mode(s) Ztap offers and the language(s) each
+         applies to. TISInputSourceID follows Apple's reverse-DNS
+         convention for input source identifiers; the primary language tag
+         "zh-Hans" (Simplified Chinese, matching this project's documented
+         scope; see the top-level README.md) is what makes macOS offer
+         Ztap under the correct language group in System Settings. -->
+    <key>ComponentInputModeDict</key>
+    <dict>
+        <key>tsInputModeListKey</key>
+        <dict>
+            <key>org.ztap.inputmethod.pinyin</key>
+            <dict>
+                <key>TISInputSourceID</key>
+                <string>org.ztap.inputmethod.pinyin</string>
+                <key>TISIntendedLanguage</key>
+                <string>zh-Hans</string>
+                <key>tsInputModePrimaryInScript</key>
+                <true/>
+            </dict>
+        </dict>
+        <key>tsVisibleInputModeOrderedArrayKey</key>
+        <array>
+            <string>org.ztap.inputmethod.pinyin</string>
+        </array>
+    </dict>
+
+    <!-- NSPrincipalClass left unset: this is an InputMethodKit executable
+         with an explicit main() (see main.rs / lib.rs::run), not a
+         plugin-style bundle that needs a principal class to be
+         instantiated by the loader. -->
+
+    <key>NSHumanReadableCopyright</key>
+    <string>Ztap Contributors. Licensed under GPL-3.0-only.</string>
+
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+</dict>
+</plist>

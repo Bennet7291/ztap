@@ -1,0 +1,39 @@
+[package]
+name    = "ztap-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ztap-core = { path = "../../core" }
+
+# WARNING: this crate could not be compiled in the environment it was
+# written in (no macOS/Xcode toolchain available -- see input_method.rs's
+# module doc comment). Feature lists below are believed correct based on
+# each crate's published docs as of writing, but have not been verified
+# against an actual `cargo build --target aarch64-apple-darwin`.
+objc2 = { version = "0.6", features = ["relax-void-encoding"] }
+objc2-foundation = { version = "0.3", features = [
+    "NSString", "NSArray", "NSDictionary", "NSAttributedString",
+    "NSBundle", "NSRange", "NSGeometry",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication", "NSResponder", "NSWindow", "NSPanel", "NSView",
+    "NSColor", "NSFont", "NSScreen", "NSGraphicsContext",
+    "NSGraphics", "NSWindowRestoration",
+] }
+objc2-input-method-kit = { version = "0.3", features = [
+    "IMKServer", "IMKInputController", "objc2-app-kit",
+] }
+# WARNING: exact feature names for CGColor/CGPath/CGContext/CGGeometry and
+# CTFont/CTFramesetter/CTFrame could not be double-checked against these
+# two crates' real Cargo.toml feature lists -- see candidate_window.rs's
+# draw_line() doc comment for the full caveat on this dependency pair.
+objc2-core-graphics = { version = "0.3", features = [
+    "CGColor", "CGPath", "CGContext", "CGGeometry",
+] }
+objc2-core-text = { version = "0.3", default-features = false }
+
+[[bin]]
+name = "Ztap"
+path = "src/main.rs"
