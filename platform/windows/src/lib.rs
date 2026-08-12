@@ -23,7 +23,7 @@ pub mod tsf;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use windows::core::{implement, ComObject, IUnknown, Interface, Result, GUID, HRESULT};
+use windows::core::{implement, IUnknown, Interface, Result, GUID, HRESULT};
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, E_NOINTERFACE, E_POINTER, HINSTANCE, S_FALSE, S_OK,
 };
@@ -114,7 +114,7 @@ impl IClassFactory_Impl for ZtapClassFactory_Impl {
         let riid = unsafe { *riid };
         // SAFETY: QueryInterface's documented contract: on success it
         // writes an owned, AddRef'd pointer into *ppv.
-        let hr = unsafe { windows_core::Interface::query(&unknown, &riid, ppv) };
+        let hr = unsafe { Interface::query(&unknown, &riid, ppv) };
         if hr.is_ok() {
             ObjectCountGuard::attach();
         }
@@ -167,7 +167,7 @@ pub unsafe extern "system" fn DllGetClassObject(
     }
 
     let factory: IClassFactory = ZtapClassFactory.into();
-    let hr = windows_core::Interface::query(&factory, &riid, ppv);
+    let hr = Interface::query(&factory, &riid, ppv);
     if hr.is_ok() {
         HRESULT(0)
     } else {

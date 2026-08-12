@@ -13,15 +13,22 @@ ztap-core = { path = "../../core" }
 # published docs as of writing, but has not been verified against an actual
 # `cargo build` on Windows. Double-check `cargo build -p ztap-windows`
 # output against this list and adjust as needed.
+#
+# NOTE: as of windows-rs 0.62, "implement" is NOT a Cargo feature — the
+# #[implement] macro (from windows-implement, re-exported via
+# windows::core) is available unconditionally, so it's simply omitted from
+# the feature list below rather than gated. This was discovered from a
+# real `cargo build` failure ("package `ztap-windows` depends on `windows`
+# with feature `implement` but `windows` does not have that feature") —
+# earlier windows-rs versions did gate the macro behind a Cargo feature of
+# that name, which is what the original (untested) draft of this file
+# assumed.
 windows = { version = "0.62", features = [
     # TSF (Text Services Framework) COM interfaces
     "Win32_UI_TextServices",
     # COM plumbing TSF's interfaces are built on (IUnknown, CoCreateInstance, ...)
     "Win32_System_Com",
     "Win32_System_Ole",
-    # Required to *implement* (not just consume) COM interfaces server-side —
-    # ZtapTextService implements ITfTextInputProcessor, ITfKeyEventSink, etc.
-    "implement",
     # Win32 fundamentals: HRESULT, error types, HWND, POINT, RECT, ...
     "Win32_Foundation",
     # Registry access for DllRegisterServer / DllUnregisterServer
