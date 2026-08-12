@@ -56,8 +56,13 @@ windows = { version = "0.62", features = [
     # Candidate window: native Win32 window + message loop
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
-    # Virtual-key constants (VK_BACK, VK_RETURN, ...) used by tsf.rs's key routing
+    # Virtual-key constants (VK_BACK, VK_RETURN, ...) used by tsf.rs's key
+    # routing. Win32_UI_Input alone is not enough -- the KeyboardAndMouse
+    # submodule needs its own feature (CI-confirmed:
+    # "could not find KeyboardAndMouse in Input", gated behind
+    # Win32_UI_Input_KeyboardAndMouse specifically).
     "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
     # Candidate window rendering: Direct2D + DirectWrite (see candidate_window.rs)
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",
@@ -68,6 +73,11 @@ windows = { version = "0.62", features = [
     "Win32_System_Com_StructuredStorage",
 ] }
 
+# Direct dependency so the bare `windows_core` path the #[implement] macro's
+# generated code expands to actually resolves -- see fix history point 2
+# above. Version pinned to match windows 0.62.x's own windows-core
+# requirement (windows 0.62.2 depends on windows-core ^0.62.2 per its
+# published Cargo metadata).
 windows-core = "0.62"
 
 [lib]
