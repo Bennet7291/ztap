@@ -15,16 +15,14 @@
 use std::cell::RefCell;
 
 use windows::core::{Result, HSTRING, PCWSTR};
-use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_MATRIX_3X2_F, D2D1_PIXEL_FORMAT, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
     D2D1_BRUSH_PROPERTIES, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_ROUNDED_RECT,
-    D2D1_SIZE_U,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
@@ -317,7 +315,7 @@ impl CandidateWindow {
         let mut client_rect = RECT::default();
         // SAFETY: self.hwnd is valid; GetClientRect's only precondition.
         unsafe { GetClientRect(self.hwnd, &mut client_rect)? };
-        let size = D2D1_SIZE_U {
+        let size = D2D_SIZE_U {
             width: (client_rect.right - client_rect.left).max(1) as u32,
             height: (client_rect.bottom - client_rect.top).max(1) as u32,
         };
@@ -477,9 +475,27 @@ unsafe fn solid_brush(rt: &ID2D1HwndRenderTarget, r: f32, g: f32, b: f32, a: f32
     let color = D2D1_COLOR_F { r, g, b, a };
     let props = D2D1_BRUSH_PROPERTIES {
         opacity: 1.0,
-        transform: Matrix3x2::identity(),
+        transform: identity_matrix(),
     };
     rt.CreateSolidColorBrush(&color, Some(&props))
+}
+
+/// Identity `D2D1_MATRIX_3X2_F` (no translation/rotation/scale/skew).
+///
+/// `windows::Foundation::Numerics::Matrix3x2` (the WinRT numerics type,
+/// which has an `identity()` constructor) is the *wrong* type here --
+/// `D2D1_BRUSH_PROPERTIES.transform` is a Win32 Direct2D
+/// `D2D1_MATRIX_3X2_F`, a distinct type from the WinRT one despite the
+/// similar name and shape. `windows-rs`'s binding of `D2D1_MATRIX_3X2_F`
+/// has no `identity()` associated function (confirmed against a
+/// third-party Direct2D-in-Rust example using the same field name), so
+/// this builds the matrix by hand: row-major `[[m11, m12], [m21, m22],
+/// [dx, dy]]`, where the identity leaves `m11 = m22 = 1.0` and every other
+/// entry `0.0`.
+fn identity_matrix() -> D2D1_MATRIX_3X2_F {
+    D2D1_MATRIX_3X2_F {
+        matrix: [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]],
+    }
 }
 
 /// The window procedure registered for `WNDCLASS_NAME`.
