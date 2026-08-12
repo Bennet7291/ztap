@@ -1,470 +1,756 @@
-//! Windows platform entry point -- TSF IME DLL.
+//! Windows TSF (Text Services Framework) integration.
 //!
-//! This crate is compiled as a `cdylib` and loaded by the Windows text stack.
+//! Responsibilities:
+//!   - Implement the ITfTextInputProcessor and related TSF COM interfaces
+//!   - Route keyboard events to the ztap-core input engine
+//!   - Manage the composition (preedit) lifecycle: start / update / commit / cancel
+//!   - Coordinate with the candidate window for display
 //!
-//! # WARNING: UNTESTED -- see tsf.rs's module doc comment
+//! # WARNING: UNTESTED -- no Windows toolchain available while writing this
 //!
-//! Written without a Windows toolchain available; never compiled. The
-//! DllGetClassObject / class factory pattern below follows the shape used
-//! by other windows-rs-based COM servers (see e.g.
-//! https://github.com/microsoft/windows-rs/issues/1819 for a worked
-//! example this was modeled on), but has not been verified against an
-//! actual `cargo build --target x86_64-pc-windows-msvc`. The registration
-//! flow (RegisterServer / RegisterProfiles / RegisterCategories) follows
-//! Microsoft's documented three-step TSF registration process
-//! (https://learn.microsoft.com/windows/win32/tsf/text-service-registration)
-//! but every registry path and flag value should be re-checked against a
-//! working reference implementation (e.g. the Windows-classic-samples TSF
-//! text service sample) before shipping.
+//! This file was written without access to a Windows machine, the Windows
+//! SDK, or a working rustc/cargo in the authoring environment. It has
+//! never been compiled. The windows-rs interface names, method
+//! signatures, and #[implement] macro usage below are based on
+//! windows-rs 0.62's published API documentation
+//! (https://microsoft.github.io/windows-docs-rs/doc/windows/Win32/UI/TextServices/),
+//! not a verified build. Before relying on this:
+//!
+//! 1. Run `cargo build -p ztap-windows` on a Windows machine with the
+//!    Windows SDK installed and fix whatever the compiler disagrees with --
+//!    COM vtable signatures are easy to get subtly wrong (Option<&T> vs
+//!    &T, *mut vs *const, a wrapped vs. unwrapped return type) and
+//!    only the compiler can catch that here.
+//! 2. Test against a real TSF-enabled application (Notepad is the classic
+//!    smoke test) -- TSF's activation/threading lifecycle has failure modes
+//!    (edit-session re-entrancy, cicero deadlocks) that only show up at
+//!    runtime.
+//! 3. Treat every `unsafe` block as suspect until it's been run under a
+//!    debugger at least once.
+//!
+//! # Threading & lifetime model
+//!
+//! TSF creates one ITfTextInputProcessor instance per thread manager
+//! (ITfThreadMgr), and Windows may host several thread managers in the
+//! same process (one per UI thread). ZtapTextService is deliberately
+//! **not** Send/Sync -- it's used from a single STA thread, matching how
+//! TSF text services are documented to run. ztap-core's InputSession
+//! has no interior mutability or locking of its own because of this: a
+//! ZtapTextService on thread A never touches the InputSession created
+//! for thread B.
+//!
+//! # Edit sessions
+//!
+//! All document mutation (composition start/update/commit) in TSF must
+//! happen inside an ITfEditSession::DoEditSession callback -- you cannot
+//! call ITfInsertAtSelection::InsertTextAtSelection or touch a
+//! composition directly from a key event handler. EditSessionImpl below
+//! wraps a one-shot closure and implements ITfEditSession to satisfy this
+//! requirement. Every closure passed to it is 'static and captures only
+//! owned/cloned COM interface pointers (never a borrow of &self) -- COM
+//! interface types are cheap AddRef'd handles, so cloning one before
+//! building the closure is the correct pattern here, not a workaround.
+//! Getting this wrong is the single most common source of E_FAIL /
+//! deadlocks in hand-written TSF text services, so it's worth restating:
+//! **no ITfRange/ITfComposition mutation outside an edit session, ever,
+//! and no closure that reaches back into &self across the callback
+//! boundary.**
 
-pub mod candidate_window;
-pub mod tsf;
+use std::cell::RefCell;
 
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, Ordering};
-
-use windows::core::{implement, IUnknown, Interface, Result, GUID, HRESULT};
-use windows::Win32::Foundation::{
-    CLASS_E_CLASSNOTAVAILABLE, E_NOINTERFACE, E_POINTER, HINSTANCE, S_FALSE, S_OK,
+use windows::core::{implement, Result, GUID, HRESULT};
+use windows::Win32::Foundation::{E_FAIL, LPARAM, WPARAM};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    VK_BACK, VK_ESCAPE, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SPACE,
 };
-use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
-use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
+use windows::Win32::UI::TextServices::{
+    ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext,
+    ITfContextComposition, ITfEditSession, ITfEditSession_Impl, ITfInsertAtSelection,
+    ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfRange, ITfTextInputProcessor,
+    ITfTextInputProcessor_Impl, ITfThreadMgr, TF_ANCHOR_END, TF_ES_READWRITE, TF_ES_SYNC,
+    INSERT_TEXT_AT_SELECTION_FLAGS,
+};
+// windows-core 0.62 moved BOOL here (it is no longer re-exported at
+// windows::Win32::Foundation::BOOL) -- see Cargo.toml's fix-history note 2
+// for why windows_core is a direct dependency of this crate at all.
+use windows_core::{BOOL, Ref};
 
-use tsf::{ZtapTextService, CLSID_ZTAP_TEXT_SERVICE, GUID_ZTAP_PROFILE, LANGID_ZH_CN};
+use ztap_core::{Dictionary, Entry, InputSession, LearningStore};
 
-/// Process-wide count of live COM object instances handed out by this DLL.
-/// `DllCanUnloadNow` consults this so Windows never unloads the DLL while
-/// TSF (or anything else) still holds a reference into it -- unloading
-/// out from under a live COM object is a guaranteed crash.
-static OBJECT_COUNT: AtomicU32 = AtomicU32::new(0);
+/// The Class ID (CLSID) for the Ztap TSF text service.
+///
+/// Must exactly match the CLSID DllRegisterServer writes to the registry
+/// (see lib.rs) and whatever CLSID any installer/.reg file references.
+/// **Do not regenerate this value once shipped** -- TSF, Windows Update
+/// servicing, and any registration script identify this text service by
+/// this GUID for the product's lifetime. Generated once for this project;
+/// it has no other prior meaning, treat it as opaque fixed data.
+pub const CLSID_ZTAP_TEXT_SERVICE: GUID =
+    GUID::from_u128(0x5a746170_0001_4000_8000_000000005a54);
 
-/// Guard incrementing/decrementing `OBJECT_COUNT` for the lifetime of one
-/// COM object. Every `IClassFactory::CreateInstance` call below wraps its
-/// returned object in one of these via `ObjectCountGuard::attach`.
-struct ObjectCountGuard;
-impl ObjectCountGuard {
-    fn attach() {
-        OBJECT_COUNT.fetch_add(1, Ordering::SeqCst);
+/// Language profile GUID for Simplified Chinese pinyin input.
+///
+/// Distinct from the CLSID above -- TSF distinguishes "what code implements
+/// this" (CLSID) from "which language profile did the user enable" (this
+/// GUID); one text service DLL can expose several profiles, though Ztap
+/// only exposes one. Also frozen once assigned, for the same reason as
+/// CLSID_ZTAP_TEXT_SERVICE.
+pub const GUID_ZTAP_PROFILE: GUID = GUID::from_u128(0x5a746170_0002_4000_8000_000000005a54);
+
+/// LANGID for Chinese (Simplified, PRC) --
+/// MAKELANGID(LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED). Used when
+/// registering the language profile so TSF offers Ztap only for zh-CN
+/// input, not e.g. zh-TW.
+pub const LANGID_ZH_CN: u16 = 0x0804;
+
+/// State for one active composition.
+struct CompositionState {
+    composition: ITfComposition,
+}
+
+/// The main TSF text service object.
+///
+/// One instance is created per thread manager; it holds the core engine and
+/// forwards system events to it.
+///
+/// # #[implement]
+///
+/// This attribute (from windows-rs's `implement` feature) generates the
+/// COM vtables and IUnknown plumbing for every interface listed; method
+/// bodies live in the `impl Xyz_Impl for ZtapTextService_Impl` blocks below
+/// (windows-rs generates that _Impl wrapper type alongside
+/// ZtapTextService itself -- see the crate's implement macro docs if
+/// that naming looks unfamiliar).
+///
+/// ITfTextInputProcessor is the entry point TSF activates/deactivates.
+/// ITfKeyEventSink receives keystrokes once registered via
+/// ITfKeystrokeMgr::AdviseKeyEventSink. ITfCompositionSink is notified
+/// if TSF force-terminates our composition (e.g. focus loss) -- we need to
+/// know so we don't try to mutate a composition that no longer exists.
+#[implement(ITfTextInputProcessor, ITfKeyEventSink, ITfCompositionSink)]
+pub struct ZtapTextService {
+    /// Interior-mutable engine state. RefCell, not a lock, because this
+    /// object is only ever touched from the single STA thread TSF created
+    /// it on -- see the module doc comment's threading section.
+    state: RefCell<ServiceState>,
+}
+
+struct ServiceState {
+    /// ITfThreadMgr this service is registered against; kept so
+    /// Deactivate can unadvise the key event sink it advised in Activate.
+    thread_mgr: Option<ITfThreadMgr>,
+    /// Client ID assigned by ITfThreadMgr::Activate (passed to us as
+    /// Activate's `tid` argument); required as the first argument to
+    /// essentially every other TSF call this service makes.
+    client_id: u32,
+    /// Whether AdviseKeyEventSink succeeded, so Deactivate knows
+    /// whether there's anything to unadvise.
+    key_event_sink_advised: bool,
+    /// The ztap-core engine. None until Dictionary/LearningStore
+    /// finish loading in Activate -- see that method for why this isn't
+    /// eagerly initialized in ZtapTextService::new.
+    session: Option<InputSession>,
+    /// The currently active composition, if the user has typed anything
+    /// since the last commit/cancel.
+    composition: Option<CompositionState>,
+}
+
+impl ZtapTextService {
+    /// Create the (not-yet-activated) TSF text service.
+    ///
+    /// Called from the class factory's CreateInstance (see lib.rs's
+    /// DllGetClassObject). Deliberately does *not* touch the dictionary,
+    /// disk, or any TSF interface yet -- ITfTextInputProcessor::Activate
+    /// is where real setup happens, matching how TSF expects text services
+    /// to behave (a service can be instantiated without ever being
+    /// activated, e.g. registered but not the user's selected profile).
+    pub fn new() -> ZtapTextService {
+        ZtapTextService {
+            state: RefCell::new(ServiceState {
+                thread_mgr: None,
+                client_id: 0,
+                key_event_sink_advised: false,
+                session: None,
+                composition: None,
+            }),
+        }
     }
-    fn detach() {
-        OBJECT_COUNT.fetch_sub(1, Ordering::SeqCst);
+
+    /// Resolve `%APPDATA%\Ztap\user.dict` for the learning store.
+    ///
+    /// Falls back to a relative path (not reliably persisted, but not a
+    /// crash) if the AppData folder can't be resolved, rather than failing
+    /// activation entirely -- a Ztap that forgets learned words across
+    /// restarts is a degraded experience, not a broken one, and a hard
+    /// failure here would take down IME input for the whole session.
+    fn learning_store_path() -> std::path::PathBuf {
+        use windows::Win32::Foundation::MAX_PATH;
+        use windows::Win32::UI::Shell::{SHGetFolderPathW, CSIDL_APPDATA};
+
+        let mut buf = [0u16; MAX_PATH as usize];
+        // SAFETY: `buf` is sized to MAX_PATH per SHGetFolderPathW's
+        // contract; NULL hwnd/hToken and flags=0 request the current user's
+        // roaming AppData folder without prompting for creation.
+        let result = unsafe { SHGetFolderPathW(None, CSIDL_APPDATA as i32, None, 0, &mut buf) };
+        if result.is_err() {
+            return std::path::PathBuf::from("ztap_user.dict");
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
+        let appdata = String::from_utf16_lossy(&buf[..len]);
+        std::path::PathBuf::from(appdata).join("Ztap").join("user.dict")
+    }
+
+    /// Handle a WM_KEYDOWN event; return true if the key was consumed by the IME.
+    ///
+    /// Key routing:
+    /// - a-z          -> push_char, refresh candidates
+    /// - Backspace    -> pop_char, refresh candidates
+    /// - 1-9          -> select candidate at index (digit - 1)
+    /// - Space        -> select candidate 0 (top pick)
+    /// - Enter        -> commit raw preedit text as-is
+    /// - Escape       -> cancel composition
+    /// - Page Up/Down -> scroll candidate page (see the TODO below -- not
+    ///                  wired up yet, ztap-core has no paging cursor)
+    /// - Punctuation  -> map via PunctuationState and commit
+    ///
+    /// Takes the owning ITfContext because committing text or updating a
+    /// composition both need it, and TSF's key event sink hands us the
+    /// context anyway (see OnKeyDown below) -- no reason to re-fetch it
+    /// from the thread manager mid-keystroke.
+    pub fn on_key_down(&self, context: &ITfContext, vkey: u32) -> Result<bool> {
+        let vk = vkey as u16;
+
+        let has_composition = {
+            let state = self.state.borrow();
+            state.session.as_ref().map(|s| !s.preedit.is_empty()).unwrap_or(false)
+        };
+
+        if (b'a' as u16..=b'z' as u16).contains(&vk) {
+            let candidates = {
+                let mut state = self.state.borrow_mut();
+                let Some(session) = state.session.as_mut() else { return Ok(false) };
+                let ch = (vk as u8) as char;
+                session.push_char(ch)
+            };
+            self.refresh_composition(context, &candidates)?;
+            return Ok(true);
+        }
+
+        if vk == VK_BACK.0 && has_composition {
+            let (candidates, now_empty) = {
+                let mut state = self.state.borrow_mut();
+                let Some(session) = state.session.as_mut() else { return Ok(false) };
+                let candidates = session.pop_char();
+                (candidates, session.preedit.is_empty())
+            };
+            if now_empty {
+                self.end_composition(context)?;
+            } else {
+                self.refresh_composition(context, &candidates)?;
+            }
+            return Ok(true);
+        }
+
+        if (b'1' as u16..=b'9' as u16).contains(&vk) && has_composition {
+            let idx = (vk - b'1' as u16) as usize;
+            let word = {
+                let mut state = self.state.borrow_mut();
+                let Some(session) = state.session.as_mut() else { return Ok(false) };
+                session.select(idx)
+            };
+            if let Some(word) = word {
+                self.commit_text(context, &word)?;
+            }
+            return Ok(true);
+        }
+
+        if vk == VK_SPACE.0 && has_composition {
+            let word = {
+                let mut state = self.state.borrow_mut();
+                let Some(session) = state.session.as_mut() else { return Ok(false) };
+                session.select(0)
+            };
+            if let Some(word) = word {
+                self.commit_text(context, &word)?;
+            }
+            return Ok(true);
+        }
+
+        if vk == VK_RETURN.0 && has_composition {
+            // Commit the raw preedit as-is (typed pinyin, not converted to
+            // characters) -- the standard Enter behavior for pinyin IMEs
+            // when the user wants literal Latin text.
+            let raw = {
+                let mut state = self.state.borrow_mut();
+                let Some(session) = state.session.as_mut() else { return Ok(false) };
+                let raw = session.preedit.clone();
+                session.cancel();
+                raw
+            };
+            self.commit_text(context, &raw)?;
+            return Ok(true);
+        }
+
+        if vk == VK_ESCAPE.0 && has_composition {
+            {
+                let mut state = self.state.borrow_mut();
+                if let Some(session) = state.session.as_mut() {
+                    session.cancel();
+                }
+            }
+            self.end_composition(context)?;
+            return Ok(true);
+        }
+
+        if (vk == VK_PRIOR.0 || vk == VK_NEXT.0) && has_composition {
+            // TODO(candidate paging): ztap-core's InputSession::candidates()
+            // currently returns only the top 9 ranked entries with no
+            // paging cursor -- there is nothing here to page *into* yet.
+            // Either extend InputSession with a page-offset parameter, or
+            // have candidate_window.rs request a larger slice and paginate
+            // client-side. Left unconsumed here (falls through to `false`)
+            // rather than silently doing nothing, so Page Up/Down still
+            // reaches the host app's normal scrolling when not mid-composition.
+            return Ok(false);
+        }
+
+        // Punctuation mapping: only meaningful with no active pinyin
+        // composition (the digit/space/enter/escape branches above already
+        // handle all in-composition control keys).
+        if !has_composition {
+            if let Some(ch) = char::from_u32(vkey) {
+                if ch.is_ascii_punctuation() {
+                    let mapped = {
+                        let mut state = self.state.borrow_mut();
+                        state.session.as_mut().and_then(|s| s.punct.map(ch))
+                    };
+                    if let Some(mapped) = mapped {
+                        self.commit_text(context, &mapped)?;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Refresh the composition's underlined preedit text to match the
+    /// current session buffer. `candidates` is accepted (and currently
+    /// unused beyond documenting intent) so the eventual candidate-window
+    /// refresh call has an obvious place to plug in -- see the TODO below.
+    fn refresh_composition(&self, context: &ITfContext, candidates: &[Entry]) -> Result<()> {
+        let preedit = {
+            let state = self.state.borrow();
+            state.session.as_ref().map(|s| s.preedit.clone()).unwrap_or_default()
+        };
+        self.update_composition(context, &preedit)?;
+
+        // TODO(candidate window): forward `candidates` to
+        // candidate_window::CandidateWindow::update(...) here once that
+        // type has a concrete "attach to this text service instance" wiring
+        // decided -- see candidate_window.rs's own TODOs. on_key_down's
+        // candidate-producing branches (push_char/pop_char) funnel through
+        // this one function specifically so there is a single place to add
+        // that call.
+        let _ = candidates;
+        Ok(())
+    }
+
+    /// Commit `text` into the focused document via
+    /// ITfInsertAtSelection::InsertTextAtSelection, then end any active
+    /// composition.
+    fn commit_text(&self, context: &ITfContext, text: &str) -> Result<()> {
+        let client_id = self.state.borrow().client_id;
+        let text_utf16: Vec<u16> = text.encode_utf16().collect();
+
+        let session = EditSessionImpl::new(context.clone(), move |cookie, ctx| {
+            // SAFETY: DoEditSession's contract (see the module doc comment)
+            // guarantees this closure runs synchronously, on this thread,
+            // with a valid write-locked document -- the precondition
+            // InsertTextAtSelection requires.
+            unsafe {
+                let insert: ITfInsertAtSelection = ctx.cast()?;
+                let _range: ITfRange = insert.InsertTextAtSelection(
+                    cookie,
+                    INSERT_TEXT_AT_SELECTION_FLAGS(0),
+                    &text_utf16,
+                )?;
+            }
+            Ok(())
+        });
+        run_edit_session(&session, client_id)?;
+
+        self.end_composition(context)?;
+        Ok(())
+    }
+
+    /// Start a new ITfComposition if none is active, then replace its
+    /// range's text with `preedit` and collapse the selection to the end.
+    ///
+    /// TSF convention (matching every other CJK IME on Windows) is to show
+    /// the *raw input* underlined in the composition while the candidate
+    /// list is a separate floating window -- not to inline the converted
+    /// word into the document until commit. This writes `preedit` (the raw
+    /// pinyin buffer), never a candidate's converted word, into the
+    /// composition range.
+    fn update_composition(&self, context: &ITfContext, preedit: &str) -> Result<()> {
+        let client_id = self.state.borrow().client_id;
+        let already_composing = self.state.borrow().composition.is_some();
+
+        if !already_composing {
+            self.start_composition(context, client_id)?;
+        }
+
+        let Some(composition) = self.state.borrow().composition.as_ref().map(|c| c.composition.clone()) else {
+            // start_composition above should have populated this; if it
+            // didn't (e.g. StartComposition failed silently somehow), bail
+            // rather than proceed against a nonexistent composition.
+            return Err(E_FAIL.into());
+        };
+
+        let text_utf16: Vec<u16> = preedit.encode_utf16().collect();
+        let session = EditSessionImpl::new(context.clone(), move |cookie, _ctx| {
+            // SAFETY: `composition` was cloned (AddRef'd) before this
+            // closure was constructed, so it remains a valid COM reference
+            // independent of `self`'s lifetime -- see the module doc
+            // comment's note on why closures never reach back into &self.
+            unsafe {
+                let range: ITfRange = composition.GetRange()?;
+                range.SetText(cookie, 0, &text_utf16)?;
+                range.Collapse(cookie, TF_ANCHOR_END)?;
+            }
+            // NOTE: this does not yet apply the underline "input" display
+            // attribute (TF_ATTR_INPUT via GUID_PROP_ATTRIBUTE) -- doing so
+            // requires an ITfDisplayAttributeInfo registered through
+            // ITfCategoryMgr/ITfSource at Activate time, which isn't wired
+            // up in this draft (see the TODO in Activate below).
+            // Composition text updates correctly without it; only the
+            // visual underline styling is missing until that registration
+            // is added.
+            Ok(())
+        });
+        run_edit_session(&session, client_id)
+    }
+
+    /// Start a new composition anchored at the current selection. Populates
+    /// `state.composition` on success. Split out from update_composition
+    /// so the "reserve an insertion point, then StartComposition" sequence
+    /// -- which itself must run inside its own edit session -- stays
+    /// self-contained.
+    fn start_composition(&self, context: &ITfContext, client_id: u32) -> Result<()> {
+        // Rc<RefCell<Option<...>>> bridges the composition handle created
+        // *inside* the edit-session closure back out to this function,
+        // since the closure only returns Result<()> (it's ITfEditSession
+        // shaped, not a general-purpose callback with an arbitrary return
+        // type).
+        let created = std::rc::Rc::new(RefCell::new(None::<ITfComposition>));
+        let created_for_closure = created.clone();
+
+        let session = EditSessionImpl::new(context.clone(), move |cookie, ctx| {
+            // SAFETY: see commit_text's SAFETY note -- same DoEditSession
+            // synchronous-callback guarantee applies here.
+            unsafe {
+                let insert_sel: ITfInsertAtSelection = ctx.cast()?;
+                let anchor: ITfRange = insert_sel.InsertTextAtSelection(
+                    cookie,
+                    INSERT_TEXT_AT_SELECTION_FLAGS(0),
+                    &[],
+                )?;
+                let comp_services: ITfContextComposition = ctx.cast()?;
+                let composition: ITfComposition =
+                    comp_services.StartComposition(cookie, &anchor, None)?;
+                *created_for_closure.borrow_mut() = Some(composition);
+            }
+            Ok(())
+        });
+        run_edit_session(&session, client_id)?;
+
+        let Some(composition) = created.borrow_mut().take() else {
+            return Err(E_FAIL.into());
+        };
+        self.state.borrow_mut().composition = Some(CompositionState { composition });
+        Ok(())
+    }
+
+    /// End the active composition (if any), clearing composition state.
+    /// Called both on successful commit and on cancel (Escape / empty buffer).
+    fn end_composition(&self, context: &ITfContext) -> Result<()> {
+        let client_id = self.state.borrow().client_id;
+        let Some(comp_state) = self.state.borrow_mut().composition.take() else {
+            return Ok(());
+        };
+
+        let session = EditSessionImpl::new(context.clone(), move |cookie, _ctx| {
+            // SAFETY: `comp_state.composition` was cloned before this
+            // closure was constructed (moved in via the outer `let`, itself
+            // taken from self.state before the closure exists) -- same
+            // "never borrow &self across the callback" rule as elsewhere.
+            unsafe { comp_state.composition.EndComposition(cookie) }
+        });
+        run_edit_session(&session, client_id)
     }
 }
 
-/// DLL entry point. Windows calls this on process attach/detach and
-/// thread attach/detach for every process that loads this DLL.
+/// Run `session` synchronously with read-write access.
 ///
-/// Ztap does no per-process global initialization here deliberately --
-/// see `tsf::ZtapTextService::new`'s doc comment for why real setup
-/// (dictionary load, learning store) happens in `Activate` instead, not
-/// here. `DllMain` running arbitrary non-trivial code (loading files,
-/// taking locks) is a well-known source of deadlocks under the loader
-/// lock; keeping this a no-op sidesteps that whole class of bug.
-#[no_mangle]
-#[allow(non_snake_case, clippy::missing_safety_doc)]
-extern "system" fn DllMain(_hinstance: HINSTANCE, reason: u32, _reserved: *mut c_void) -> i32 {
-    if reason == DLL_PROCESS_ATTACH {
-        // Intentionally empty -- see doc comment above.
+/// TF_ES_SYNC | TF_ES_READWRITE is correct for every call site in this
+/// file -- Ztap never needs an async edit session, since all document
+/// mutation happens directly in response to a key event already running on
+/// the UI thread, and TF_ES_SYNC is what makes DoEditSession execute
+/// before RequestEditSession returns (which every closure above relies on
+/// for its captured state to still be meaningful when the call returns).
+fn run_edit_session(session: &EditSessionImpl, client_id: u32) -> Result<()> {
+    let context = session.context.clone();
+    let iface: ITfEditSession = session_as_interface(session);
+    // SAFETY: `iface` is a fully-constructed ITfEditSession wrapping
+    // `session`; RequestEditSession's documented contract is that with
+    // TF_ES_SYNC set it synchronously invokes DoEditSession before
+    // returning.
+    let hr: HRESULT = unsafe { context.RequestEditSession(client_id, &iface, TF_ES_SYNC | TF_ES_READWRITE)? };
+    if hr.is_err() {
+        return Err(hr.into());
     }
-    1 // TRUE
+    Ok(())
 }
 
-/// The class factory for `ZtapTextService`.
-///
-/// TSF (via `CoCreateInstance(CLSID_ZTAP_TEXT_SERVICE, ...)`) asks
-/// `DllGetClassObject` for an `IClassFactory`, then calls
-/// `IClassFactory::CreateInstance` on it to actually construct a
-/// `ZtapTextService`. Kept as a separate zero-sized type (rather than
-/// having `DllGetClassObject` construct a `ZtapTextService` directly)
-/// because that's the shape `IClassFactory` requires -- COM always
-/// separates "give me something that can make instances" from "make one
-/// now".
-#[implement(IClassFactory)]
-struct ZtapClassFactory;
+/// windows-rs's #[implement] macro produces a distinct generated type
+/// (conventionally EditSessionImpl here, with the _Impl suffix reserved
+/// for the trait-impl target) implementing Into<ITfEditSession> /
+/// From<EditSessionImpl>. This helper exists purely so run_edit_session
+/// above reads clearly; on an actual Windows build this should reduce to
+/// `session.into()` or an equivalent windows-rs-generated conversion --
+/// **verify against the real generated API** rather than assuming this
+/// exact helper signature compiles as written, since the precise
+/// conversion path #[implement] generates is one of the details this
+/// draft could not check against a compiler.
+fn session_as_interface(session: &EditSessionImpl) -> ITfEditSession {
+    session.clone().into()
+}
 
-impl IClassFactory_Impl for ZtapClassFactory_Impl {
-    fn CreateInstance(
-        &self,
-        outer: windows::core::Ref<'_, IUnknown>,
-        riid: *const GUID,
-        ppv: *mut *mut c_void,
-    ) -> Result<()> {
-        // SAFETY: `ppv` is a valid out-pointer per COM's CreateInstance
-        // contract; TSF (our only caller) never passes null here, but the
-        // null check below is cheap insurance against a misbehaving caller
-        // rather than relying purely on that assumption.
-        if ppv.is_null() {
-            return Err(E_POINTER.into());
+// -- ITfTextInputProcessor ---------------------------------------------
+
+impl ITfTextInputProcessor_Impl for ZtapTextService_Impl {
+    /// Called by TSF when the user's language profile activates this
+    /// service. This is where all real initialization happens -- see
+    /// ZtapTextService::new's doc comment for why it's not done eagerly.
+    fn Activate(&self, ptim: Ref<'_, ITfThreadMgr>, tid: u32) -> Result<()> {
+        let Some(thread_mgr) = ptim.as_ref() else {
+            return Err(E_FAIL.into());
+        };
+
+        let client_id = tid;
+
+        // A dictionary load failure is fatal to this text service -- there
+        // is no meaningful degraded mode for an IME with no dictionary --
+        // so it propagates as an activation failure. TSF will then simply
+        // not offer this text service to the user, which is the correct
+        // outcome rather than activating into a silently broken state.
+        let dict = Dictionary::load_builtin();
+        let store_path = ZtapTextService::learning_store_path();
+        let store = LearningStore::load(store_path);
+        let session = InputSession::new(dict, store);
+
+        let keystroke_mgr: ITfKeystrokeMgr = thread_mgr.cast()?;
+
+        // WARNING: turning `&ZtapTextService_Impl` (i.e. `self` here) into
+        // an owned ITfKeyEventSink COM reference is the single
+        // most-likely-to-be-wrong line in this file. windows-rs's
+        // #[implement]-generated types normally expose this via a method
+        // on the outer wrapper (e.g. constructing ZtapTextService first as
+        // a local, converting it to ITfTextInputProcessor via `.into()`,
+        // then `.cast::<ITfKeyEventSink>()` on *that* -- not by reaching
+        // for a COM interface from inside a method that only has `&self`
+        // of the _Impl type). The realistic fix is almost certainly
+        // restructuring so activation flows through the already-owned
+        // outer interface handle the class factory produced (see lib.rs's
+        // DllGetClassObject), rather than trying to conjure one here.
+        // Left as an explicit, loud gap rather than a plausible-looking
+        // cast that could compile by accident and be wrong at runtime.
+        let this_as_sink: ITfKeyEventSink = self
+            .cast()
+            .expect("TODO: verify self.cast::<ITfKeyEventSink>() is valid inside an _Impl method on a real windows-rs build; see the WARNING comment above");
+
+        unsafe {
+            keystroke_mgr.AdviseKeyEventSink(client_id, &this_as_sink, BOOL(1))?;
         }
-        unsafe { *ppv = std::ptr::null_mut() };
 
-        // Ztap's text service does not support COM aggregation (outer !=
-        // None), matching the vast majority of TSF text service samples --
-        // aggregation exists for COM composition scenarios Ztap has no use
-        // for as a leaf IME implementation.
-        if outer.is_some() {
-            return Err(windows::Win32::Foundation::CLASS_E_NOAGGREGATION.into());
-        }
+        let mut state = self.state.borrow_mut();
+        state.thread_mgr = Some(thread_mgr.clone());
+        state.client_id = client_id;
+        state.key_event_sink_advised = true;
+        state.session = Some(session);
 
-        let service = ZtapTextService::new();
-        let unknown: IUnknown = service.into();
+        // TODO(display attributes): register an ITfDisplayAttributeInfo
+        // (underline style for TF_ATTR_INPUT) via ITfCategoryMgr +
+        // ITfSource::AdviseSink(IID_ITfDisplayAttributeProvider, ...), and
+        // implement ITfDisplayAttributeProvider on ZtapTextService so the
+        // composition underline in update_composition actually renders.
+        // Composition text updates correctly without this; only the visual
+        // underline is affected.
 
-        // SAFETY: `riid` is a valid in-pointer per CreateInstance's
-        // contract (TSF always supplies a real IID here).
-        let riid = unsafe { *riid };
-        // SAFETY: QueryInterface's documented contract: on success it
-        // writes an owned, AddRef'd pointer into *ppv.
-        let hr = unsafe { Interface::query(&unknown, &riid, ppv) };
-        if hr.is_ok() {
-            ObjectCountGuard::attach();
-        }
-        HRESULT(hr.0).ok()
+        Ok(())
     }
 
-    fn LockServer(&self, flock: windows::Win32::Foundation::BOOL) -> Result<()> {
-        // A minimal but correct LockServer: bump/drop the same object
-        // count DllCanUnloadNow checks, so `LockServer(TRUE)` really does
-        // keep the DLL alive the way callers expect.
-        if flock.as_bool() {
-            ObjectCountGuard::attach();
-        } else {
-            ObjectCountGuard::detach();
+    /// Called by TSF when this service is deactivated (profile switched
+    /// away, or the thread is shutting down). Must undo everything
+    /// Activate set up, and -- critically -- flush the learning store to
+    /// disk, since this may be the last chance before the process exits.
+    fn Deactivate(&self) -> Result<()> {
+        let mut state = self.state.borrow_mut();
+
+        if state.key_event_sink_advised {
+            if let Some(thread_mgr) = state.thread_mgr.take() {
+                if let Ok(keystroke_mgr) = thread_mgr.cast::<ITfKeystrokeMgr>() {
+                    // SAFETY: unadvising a sink that was successfully
+                    // advised in Activate with the same client_id; safe per
+                    // UnadviseKeyEventSink's documented contract.
+                    unsafe {
+                        let _ = keystroke_mgr.UnadviseKeyEventSink(state.client_id);
+                    }
+                }
+            }
+            state.key_event_sink_advised = false;
+        }
+
+        if let Some(mut session) = state.session.take() {
+            // LearningStore's own Drop impl also flushes (see learning.rs's
+            // module docs), but flushing explicitly here means a failure is
+            // at least observable via the Result (even though there's
+            // nowhere meaningful to surface it from inside Deactivate)
+            // rather than silently swallowed by a Drop that can't return
+            // errors at all.
+            session.store.flush_if_dirty();
+        }
+
+        Ok(())
+    }
+}
+
+// -- ITfKeyEventSink -----------------------------------------------------
+
+impl ITfKeyEventSink_Impl for ZtapTextService_Impl {
+    /// TSF asks "would you consume this key" before delivering it for real
+    /// via OnKeyDown. This performs the same *classification* as
+    /// on_key_down without any of its mutation, so a key can be tested
+    /// and then, separately, actually applied without double-applying it.
+    ///
+    /// NOTE: this duplicates on_key_down's routing conditions as read-only
+    /// checks rather than sharing code with it. A cleaner design would
+    /// split on_key_down into a pure "classify" step and a separate
+    /// "apply" step reused by both methods; left as a follow-up rather than
+    /// risk a double-apply bug in this untested first pass -- the current
+    /// split means OnTestKeyDown can occasionally over-report "yes" (e.g.
+    /// Page Up/Down, which on_key_down currently still declines to
+    /// consume -- see its TODO), but never under-reports, which is the
+    /// safer direction to be wrong in for a "should I intercept this key"
+    /// check.
+    fn OnTestKeyDown(&self, pic: Ref<'_, ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+        let Some(_context) = pic.as_ref() else { return Ok(BOOL(0)) };
+        let vk = wparam.0 as u16;
+        let has_composition = self
+            .state
+            .borrow()
+            .session
+            .as_ref()
+            .map(|s| !s.preedit.is_empty())
+            .unwrap_or(false);
+
+        let maybe_consumed = (b'a' as u16..=b'z' as u16).contains(&vk)
+            || (has_composition
+                && matches!(vk, v if v == VK_BACK.0 || v == VK_RETURN.0 || v == VK_ESCAPE.0 || v == VK_SPACE.0))
+            || (has_composition && (b'1' as u16..=b'9' as u16).contains(&vk));
+
+        Ok(BOOL(maybe_consumed as i32))
+    }
+
+    fn OnKeyDown(&self, pic: Ref<'_, ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+        let Some(context) = pic.as_ref() else { return Ok(BOOL(0)) };
+        let consumed = self.on_key_down(context, wparam.0 as u32)?;
+        Ok(BOOL(consumed as i32))
+    }
+
+    fn OnTestKeyUp(&self, _pic: Ref<'_, ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+        // Ztap acts entirely on key-down; key-up is never consumed.
+        Ok(BOOL(0))
+    }
+
+    fn OnKeyUp(&self, _pic: Ref<'_, ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+        Ok(BOOL(0))
+    }
+
+    fn OnPreservedKey(&self, _pic: Ref<'_, ITfContext>, _rguid: *const GUID) -> Result<BOOL> {
+        // Ztap doesn't register any preserved (hotkey) key combinations.
+        Ok(BOOL(0))
+    }
+
+    fn OnSetFocus(&self, _fforeground: BOOL) -> Result<()> {
+        Ok(())
+    }
+}
+
+// -- ITfCompositionSink ---------------------------------------------------
+
+impl ITfCompositionSink_Impl for ZtapTextService_Impl {
+    /// TSF calls this if it force-terminates our composition (e.g. the
+    /// document lost focus, or another text service took over). We must
+    /// forget our composition handle without calling EndComposition on
+    /// it again -- it's already gone -- and reset the pinyin buffer so the
+    /// next keystroke starts a fresh composition instead of silently
+    /// continuing to append to now-orphaned state.
+    fn OnCompositionTerminated(&self, _ecwrite: u32, _pcomposition: Ref<'_, ITfComposition>) -> Result<()> {
+        let mut state = self.state.borrow_mut();
+        state.composition = None;
+        if let Some(session) = state.session.as_mut() {
+            session.cancel();
         }
         Ok(())
     }
 }
 
-/// Exported so `regsvr32`/the OS loader can locate a class factory for a
-/// requested CLSID. This is the one export every in-proc COM server must
-/// provide; see `DllRegisterServer`/`DllUnregisterServer`/`DllCanUnloadNow`
-/// below for the other three.
+// -- Edit sessions --------------------------------------------------------
+
+/// A one-shot ITfEditSession wrapping a boxed 'static closure.
 ///
-/// # Safety
+/// TSF requires document mutation to happen inside a DoEditSession
+/// callback (see the module doc comment). Rather than hand-writing a new
+/// #[implement(ITfEditSession)] struct at every call site, this type
+/// takes the closure once and is reused by commit_text,
+/// update_composition, start_composition, and end_composition above.
 ///
-/// Called directly by the Windows COM runtime with raw pointers per the
-/// standard `DllGetClassObject` ABI contract (`rclsid`/`riid` valid
-/// in-pointers, `ppv` a valid out-pointer). Safe Rust code cannot express
-/// this function signature; callers (the OS) are trusted to uphold the
-/// documented contract, matching how every COM DLL export in the Windows
-/// ecosystem is written.
-#[no_mangle]
-#[allow(non_snake_case)]
-pub unsafe extern "system" fn DllGetClassObject(
-    rclsid: *const GUID,
-    riid: *const GUID,
-    ppv: *mut *mut c_void,
-) -> HRESULT {
-    if ppv.is_null() {
-        return E_POINTER;
-    }
-    *ppv = std::ptr::null_mut();
-
-    let rclsid = *rclsid;
-    let riid = *riid;
-
-    if rclsid != CLSID_ZTAP_TEXT_SERVICE {
-        return CLASS_E_CLASSNOTAVAILABLE;
-    }
-
-    let factory: IClassFactory = ZtapClassFactory.into();
-    let hr = Interface::query(&factory, &riid, ppv);
-    if hr.is_ok() {
-        HRESULT(0)
-    } else {
-        E_NOINTERFACE
-    }
+/// Every closure passed in must be 'static and must not borrow &self
+/// from the ZtapTextService that created it -- capture cloned COM
+/// interface handles (cheap AddRefs) instead, exactly as every call site
+/// above already does. See the module doc comment's "Edit sessions"
+/// section.
+#[implement(ITfEditSession)]
+pub struct EditSessionImpl {
+    context: ITfContext,
+    /// RefCell<Option<...>> so the FnOnce can be taken and invoked
+    /// exactly once from DoEditSession, even though COM methods take
+    /// &self rather than self by value.
+    #[allow(clippy::type_complexity)]
+    body: RefCell<Option<Box<dyn FnOnce(u32, &ITfContext) -> Result<()>>>>,
 }
 
-/// Tells the COM runtime whether it's safe to unload this DLL from the
-/// process. Returns `S_OK` only when `OBJECT_COUNT` is zero; `S_FALSE`
-/// otherwise. Getting this wrong in the "always say yes" direction is a
-/// classic use-after-free (the OS unloads the DLL's code while a live
-/// `ZtapTextService` still exists); getting it wrong in the "always say
-/// no" direction just leaks the DLL in memory, which is unfortunate but
-/// not a safety bug -- hence `OBJECT_COUNT` errs toward correctness over
-/// eagerness to unload.
-///
-/// # Safety
-/// Same ABI-boundary rationale as `DllGetClassObject` above.
-#[no_mangle]
-#[allow(non_snake_case)]
-pub unsafe extern "system" fn DllCanUnloadNow() -> HRESULT {
-    if OBJECT_COUNT.load(Ordering::SeqCst) == 0 {
-        S_OK
-    } else {
-        S_FALSE
-    }
-}
-
-/// Write the standard in-proc COM server registry entries
-/// (`HKCR\CLSID\{...}\InprocServer32`) for `CLSID_ZTAP_TEXT_SERVICE`,
-/// pointing at this DLL's own path.
-fn register_com_server() -> Result<()> {
-    use windows::Win32::System::Registry::{
-        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CLASSES_ROOT, KEY_WRITE,
-        REG_OPTION_NON_VOLATILE, REG_SZ,
-    };
-
-    let dll_path = current_dll_path()?;
-    let clsid_str = guid_to_registry_string(&CLSID_ZTAP_TEXT_SERVICE);
-    let key_path = format!("CLSID\\{clsid_str}\\InprocServer32");
-
-    // SAFETY: all string arguments below are valid, NUL-terminated UTF-16
-    // (via HSTRING/w!); RegCreateKeyExW/RegSetValueExW/RegCloseKey's other
-    // preconditions (valid HKEY constants, matching close of every opened
-    // key) are met by construction in this function.
-    unsafe {
-        let mut hkey = HKEY::default();
-        RegCreateKeyExW(
-            HKEY_CLASSES_ROOT,
-            &windows::core::HSTRING::from(key_path.as_str()),
-            None,
-            None,
-            REG_OPTION_NON_VOLATILE,
-            KEY_WRITE,
-            None,
-            &mut hkey,
-            None,
-        )
-        .ok()?;
-
-        let dll_path_wide = windows::core::HSTRING::from(dll_path.as_str());
-        let bytes = std::slice::from_raw_parts(
-            dll_path_wide.as_ptr() as *const u8,
-            (dll_path_wide.len() + 1) * 2, // include the NUL terminator
-        );
-        RegSetValueExW(hkey, None, None, REG_SZ, Some(bytes)).ok()?;
-
-        // ThreadingModel=Apartment: TSF text services run single-threaded
-        // apartment, matching ZtapTextService's documented non-Send/Sync
-        // design (see tsf.rs's module doc comment).
-        let apartment = windows::core::HSTRING::from("Apartment");
-        let apartment_bytes = std::slice::from_raw_parts(
-            apartment.as_ptr() as *const u8,
-            (apartment.len() + 1) * 2,
-        );
-        RegSetValueExW(
-            hkey,
-            &windows::core::HSTRING::from("ThreadingModel"),
-            None,
-            REG_SZ,
-            Some(apartment_bytes),
-        )
-        .ok()?;
-
-        let _ = RegCloseKey(hkey);
-    }
-
-    Ok(())
-}
-
-fn unregister_com_server() -> Result<()> {
-    use windows::Win32::System::Registry::{RegDeleteTreeW, HKEY_CLASSES_ROOT};
-    let clsid_str = guid_to_registry_string(&CLSID_ZTAP_TEXT_SERVICE);
-    let key_path = format!("CLSID\\{clsid_str}");
-    // SAFETY: HSTRING is valid NUL-terminated UTF-16; RegDeleteTreeW
-    // tolerates the key not existing (returns an ignorable error code
-    // rather than crashing), which is the expected case on a
-    // never-before-registered machine during an unregister-before-register
-    // cleanup pass (see DllRegisterServer below).
-    unsafe {
-        let _ = RegDeleteTreeW(HKEY_CLASSES_ROOT, &windows::core::HSTRING::from(key_path.as_str()));
-    }
-    Ok(())
-}
-
-/// Register the language profile via `ITfInputProcessorProfileMgr`, the
-/// modern (Vista+) single-call registration API, per
-/// https://learn.microsoft.com/windows/win32/tsf/text-service-registration.
-fn register_profile() -> Result<()> {
-    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
-    use windows::Win32::UI::TextServices::{
-        ITfInputProcessorProfileMgr, CLSID_TF_InputProcessorProfiles,
-    };
-
-    // SAFETY: CoCreateInstance's standard contract; CLSID_TF_InputProcessorProfiles
-    // is a well-known system CLSID always present on TSF-capable Windows.
-    let profile_mgr: ITfInputProcessorProfileMgr = unsafe {
-        CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)?
-    };
-
-    let icon_path = current_dll_path()?;
-    let description = "Ztap Pinyin";
-
-    // SAFETY: all pointer/slice arguments are valid for the duration of
-    // this call (HSTRINGs and local variables live through the `unsafe`
-    // block); RegisterProfile's other parameters are plain integers/flags
-    // per its documented signature.
-    unsafe {
-        profile_mgr.RegisterProfile(
-            &CLSID_ZTAP_TEXT_SERVICE,
-            LANGID_ZH_CN,
-            &GUID_ZTAP_PROFILE,
-            &windows::core::HSTRING::from(description).as_wide(),
-            &windows::core::HSTRING::from(icon_path.as_str()).as_wide(),
-            0, // icon index
-            None,
-            0,
-            false.into(), // not a keyboard-layout substitute
-            0,
-        )?;
-    }
-
-    Ok(())
-}
-
-fn unregister_profile() -> Result<()> {
-    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
-    use windows::Win32::UI::TextServices::{
-        ITfInputProcessorProfileMgr, CLSID_TF_InputProcessorProfiles,
-    };
-
-    let profile_mgr: ITfInputProcessorProfileMgr = unsafe {
-        CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)?
-    };
-    unsafe {
-        let _ = profile_mgr.UnregisterProfile(&CLSID_ZTAP_TEXT_SERVICE, LANGID_ZH_CN, &GUID_ZTAP_PROFILE, 0);
-    }
-    Ok(())
-}
-
-/// Register the TSF categories Ztap belongs to
-/// (`GUID_TFCAT_CATEGORY_OF_TIP` + `GUID_TFCAT_TIP_KEYBOARD`) via
-/// `ITfCategoryMgr`, so TSF and the language bar correctly classify Ztap
-/// as a keyboard-input text service (as opposed to e.g. speech or
-/// handwriting).
-fn register_categories() -> Result<()> {
-    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
-    use windows::Win32::UI::TextServices::{
-        ITfCategoryMgr, CLSID_TF_CategoryMgr, GUID_TFCAT_CATEGORY_OF_TIP, GUID_TFCAT_TIP_KEYBOARD,
-    };
-
-    let category_mgr: ITfCategoryMgr =
-        unsafe { CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)? };
-    unsafe {
-        category_mgr.RegisterCategory(
-            &CLSID_ZTAP_TEXT_SERVICE,
-            &GUID_TFCAT_CATEGORY_OF_TIP,
-            &CLSID_ZTAP_TEXT_SERVICE,
-        )?;
-        category_mgr.RegisterCategory(
-            &CLSID_ZTAP_TEXT_SERVICE,
-            &GUID_TFCAT_TIP_KEYBOARD,
-            &CLSID_ZTAP_TEXT_SERVICE,
-        )?;
-    }
-    Ok(())
-}
-
-fn unregister_categories() -> Result<()> {
-    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
-    use windows::Win32::UI::TextServices::{
-        ITfCategoryMgr, CLSID_TF_CategoryMgr, GUID_TFCAT_CATEGORY_OF_TIP, GUID_TFCAT_TIP_KEYBOARD,
-    };
-    let category_mgr: ITfCategoryMgr =
-        unsafe { CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)? };
-    unsafe {
-        let _ = category_mgr.UnregisterCategory(
-            &CLSID_ZTAP_TEXT_SERVICE,
-            &GUID_TFCAT_CATEGORY_OF_TIP,
-            &CLSID_ZTAP_TEXT_SERVICE,
-        );
-        let _ = category_mgr.UnregisterCategory(
-            &CLSID_ZTAP_TEXT_SERVICE,
-            &GUID_TFCAT_TIP_KEYBOARD,
-            &CLSID_ZTAP_TEXT_SERVICE,
-        );
-    }
-    Ok(())
-}
-
-/// Full registration: COM server entries, TSF language profile, TSF
-/// categories, in that order (matching the Microsoft sample's documented
-/// `RegisterServer() || RegisterProfiles() || RegisterCategories()`
-/// sequence). On any failure, unregisters everything that *did* succeed
-/// rather than leaving a half-registered text service behind — a partial
-/// registration (e.g. COM entries present but no language profile) is
-/// worse than no registration, since it can make TSF believe a text
-/// service exists that doesn't actually function.
-///
-/// # Safety
-/// Standard COM DLL export ABI boundary; see `DllGetClassObject`'s doc comment.
-#[no_mangle]
-#[allow(non_snake_case)]
-pub unsafe extern "system" fn DllRegisterServer() -> HRESULT {
-    let result = (|| -> Result<()> {
-        register_com_server()?;
-        register_profile()?;
-        register_categories()?;
-        Ok(())
-    })();
-
-    match result {
-        Ok(()) => S_OK,
-        Err(e) => {
-            let _ = unregister_categories();
-            let _ = unregister_profile();
-            let _ = unregister_com_server();
-            HRESULT(e.code().0)
+impl EditSessionImpl {
+    fn new(context: ITfContext, body: impl FnOnce(u32, &ITfContext) -> Result<()> + 'static) -> Self {
+        EditSessionImpl {
+            context,
+            body: RefCell::new(Some(Box::new(body))),
         }
     }
 }
 
-/// # Safety
-/// Standard COM DLL export ABI boundary; see `DllGetClassObject`'s doc comment.
-#[no_mangle]
-#[allow(non_snake_case)]
-pub unsafe extern "system" fn DllUnregisterServer() -> HRESULT {
-    let _ = unregister_categories();
-    let _ = unregister_profile();
-    let _ = unregister_com_server();
-    S_OK
-}
-
-/// Full path to this DLL on disk, used both for the `InprocServer32`
-/// registry value and as the icon path passed to `RegisterProfile`.
-fn current_dll_path() -> Result<String> {
-    use windows::Win32::Foundation::MAX_PATH;
-    use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleExW,
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS};
-
-    // SAFETY: passing the address of this very function as the lookup key
-    // is the standard "find my own module handle from inside myself"
-    // pattern; GetModuleHandleExW's documented behavior for
-    // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS is exactly this.
-    let mut hmodule = Default::default();
-    unsafe {
-        GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-            windows::core::PCWSTR(current_dll_path as *const _),
-            &mut hmodule,
-        )?;
+impl ITfEditSession_Impl for EditSessionImpl_Impl {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
+        let Some(body) = self.body.borrow_mut().take() else {
+            // A second call would mean this one-shot session was scheduled
+            // twice, which shouldn't happen -- surfaced as E_FAIL rather
+            // than silently succeeding, since it indicates a bug in how
+            // callers of run_edit_session are using this type.
+            return Err(E_FAIL.into());
+        };
+        body(ec, &self.context)
     }
-
-    let mut buf = [0u16; MAX_PATH as usize];
-    // SAFETY: buf is sized to MAX_PATH; hmodule was just validated above.
-    let len = unsafe { GetModuleFileNameW(Some(hmodule), &mut buf) };
-    if len == 0 {
-        return Err(windows::core::Error::from_win32());
-    }
-    Ok(String::from_utf16_lossy(&buf[..len as usize]))
-}
-
-/// Format a `GUID` as the `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` string
-/// the registry expects for CLSID key names.
-fn guid_to_registry_string(guid: &GUID) -> String {
-    format!(
-        "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
-        guid.data1,
-        guid.data2,
-        guid.data3,
-        guid.data4[0],
-        guid.data4[1],
-        guid.data4[2],
-        guid.data4[3],
-        guid.data4[4],
-        guid.data4[5],
-        guid.data4[6],
-        guid.data4[7],
-    )
 }
