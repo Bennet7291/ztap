@@ -19,7 +19,7 @@
 use std::cell::RefCell;
 
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
+use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, AnyThread, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSBackingStoreType, NSColor, NSFont, NSGraphicsContext, NSPanel, NSScreen, NSView,
@@ -67,20 +67,31 @@ define_class!(
     //   off the main thread, matching how every AppKit view must be used.
     // - CandidateView does not implement Drop.
     //
-    // NOTE: the `#[unsafe(super(NSView))]` attribute syntax below is
-    // transcribed from objc2's `define_class!` macro-reference page; a
-    // *different* worked example elsewhere in objc2's own docs instead
-    // shows `#[unsafe(super = NSObject)]` (note `=` instead of `(...)`).
-    // These may be equivalent forms across objc2 versions, or one may be
-    // stale -- **verify against the exact objc2 version in Cargo.lock**
-    // before trusting this compiles as written.
-    #[unsafe(super(NSView))]
+    // CI-CONFIRMED FIX: `#[unsafe(super = NSView)]` (with `=`), not
+    // `#[unsafe(super(NSView))]` (with parens) -- every real example
+    // found (objc2's own docs.rs example, the hello_world_app.rs sample
+    // in objc2's repo) uses the `=` form; the `(...)` form used in the
+    // original draft of this file does not exist in the macro's actual
+    // grammar and was a guess made without a compiler available to check
+    // it against.
+    #[unsafe(super = NSView)]
     #[thread_kind = MainThreadOnly]
     #[name = "ZtapCandidateView"]
     #[ivars = ViewIvars]
     struct CandidateView;
 
-    unsafe impl CandidateView {
+    // CI-CONFIRMED FIX: methods that override the superclass's own
+    // methods (drawRect:, isFlipped -- not a named delegate protocol)
+    // go in a plain `impl CandidateView { ... }` block, not
+    // `unsafe impl CandidateView { ... }`. `define_class!`'s method-block
+    // grammar is `unsafe impl $protocol:ident for $for:ty { ... }` for
+    // protocol conformance specifically; a block with no protocol name is
+    // a plain `impl`. This was the exact cause of CI's "no rules expected
+    // an opening brace" error pointing at this line. Confirmed against
+    // objc2's own docs.rs worked example (the
+    // `MyCustomObject`/`foo`/`myClassMethod` example), which uses exactly
+    // this plain-`impl` shape for arbitrary custom/overridden methods.
+    impl CandidateView {
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty_rect: NSRect) {
             self.paint();
@@ -95,6 +106,11 @@ define_class!(
             true
         }
     }
+
+    // Required on every define_class! type regardless of superclass, per
+    // every real example found -- even though NSObjectProtocol has no
+    // required methods, the impl block itself must be present.
+    unsafe impl NSObjectProtocol for CandidateView {}
 );
 
 impl CandidateView {
