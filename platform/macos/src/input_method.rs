@@ -59,8 +59,8 @@ use std::cell::RefCell;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol};
-use objc2::{define_class, msg_send, AnyThread, ClassType, DefinedClass};
-use objc2_foundation::{NSArray, NSInteger, NSRange, NSRect, NSString, NSUInteger};
+use objc2::{define_class, msg_send, DefinedClass};
+use objc2_foundation::{NSInteger, NSRange, NSRect, NSString, NSUInteger};
 use objc2_input_method_kit::{IMKInputController, NSObjectIMKServerInput};
 
 use ztap_core::{Dictionary, Entry, InputSession, LearningStore};
@@ -70,7 +70,16 @@ use crate::candidate_window::CandidateWindow;
 /// macOS virtual key codes Ztap cares about (from `<Carbon/Events.h>` /
 /// `<HIToolbox/Events.h>`'s well-known constants -- these are stable ABI,
 /// not something objc2 wraps, so they're spelled out directly).
+///
+/// CI-CONFIRMED FIX: `NSInteger` was reported as not found inside this
+/// module even though it's imported at the top of the file -- a plain
+/// `mod vk { ... }` does not inherit its parent module's `use` items in
+/// Rust; each module's item scope is independent. `use super::*;` pulls
+/// the parent file's imports (including `NSInteger`) into this inner
+/// module explicitly.
 mod vk {
+    use super::*;
+
     pub const RETURN: NSInteger = 0x24;
     pub const DELETE: NSInteger = 0x33; // Backspace
     pub const ESCAPE: NSInteger = 0x35;
@@ -113,21 +122,19 @@ define_class!(
     //   fields drop normally.
     // CI-CONFIRMED FIX: `#[unsafe(super = IMKInputController)]` (with
     // `=`), not `#[unsafe(super(IMKInputController))]` (with parens) --
-    // same fix as candidate_window.rs's CandidateView; see that file for
-    // the confirming examples. The `(...)` form does not exist in
-    // define_class!'s actual grammar.
+    // confirmed against objc2's own docs.rs worked example. The `(...)`
+    // form does not exist in define_class!'s actual grammar.
     #[unsafe(super = IMKInputController)]
     #[name = "ZtapInputController"]
     #[ivars = Ivars]
     struct ZtapInputController;
 
     // Required on every define_class! type regardless of superclass --
-    // see candidate_window.rs's CandidateView for the confirming examples
-    // (every real define_class! usage found implements this, even when
-    // empty). Missing this was an omission in the original draft, not
-    // something CI's first error round caught (candidate_window.rs's
-    // syntax error was fatal enough that CI likely never reached
-    // typechecking this file), so it's fixed proactively here rather than
+    // confirmed against objc2's own docs.rs worked example (every real
+    // define_class! usage found implements this, even when empty).
+    // Missing this was an omission in the original draft, not something
+    // CI's first error round caught (this file had other, more immediately
+    // fatal errors first), so it's fixed proactively here rather than
     // waiting for a further round-trip.
     unsafe impl NSObjectProtocol for ZtapInputController {}
 
@@ -170,18 +177,25 @@ define_class!(
             self.commit_text(&raw, sender);
         }
 
-        #[unsafe(method(candidates:))]
-        unsafe fn candidates(&self, _sender: Option<&AnyObject>) -> Option<Retained<NSArray>> {
-            // Only meaningful if Ztap used IMKCandidates (Apple's built-in
-            // candidate-window class) instead of the custom CandidateWindow
-            // in candidate_window.rs. Ztap draws its own candidate panel
-            // (matching the "no cross-platform GUI framework, roll our own"
-            // rule that governs candidate_window.rs on Windows too), so this
-            // is never actually queried by IMKit in practice -- left as a
-            // correctly-typed no-op rather than omitted, since
-              // NSObjectIMKServerInput's default already covers "not used."
-            None
-        }
+        // CI-CONFIRMED REMOVAL: the original draft included a `candidates:`
+        // override returning `Option<Retained<NSArray>>` here. This broke
+        // the build in two independent, serious ways: (1) bare
+        // (unparameterized) `NSArray` does not implement `Encode`, so
+        // `Option<Retained<NSArray>>` can't cross the Objective-C method
+        // boundary at all -- `define_class!` failed to generate valid
+        // registration code for the whole `impl` block because of it; (2)
+        // this in turn produced a `Sealed`-trait error on the entire
+        // `NSObjectIMKServerInput` impl, since `define_class!` couldn't
+        // finish wiring up the sealed-trait plumbing for a block containing
+        // a non-`Encode`-able method. Since Ztap draws its own candidate
+        // panel (see candidate_window.rs) rather than using IMKit's
+        // built-in `IMKCandidates`, this method was never actually called
+        // by IMKit in practice -- removing it entirely is a clean fix, not
+        // a functional loss. If a future need for `IMKCandidates`
+        // integration arises, the correct return type is almost certainly
+        // `Option<Retained<NSArray<AnyObject>>>` (an explicitly
+        // parameterized NSArray) rather than bare `NSArray` -- untested,
+        // since this draft has no use for it.
     }
 );
 
