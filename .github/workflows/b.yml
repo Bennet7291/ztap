@@ -12,6 +12,7 @@ permissions:
 jobs:
   build:
     name: Build ${{ matrix.target }}
+
     strategy:
       fail-fast: false
       matrix:
@@ -27,70 +28,108 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
+
+      # -------------------------
+      # Checkout
+      # -------------------------
       - name: Checkout
         uses: actions/checkout@v4
 
 
+      # -------------------------
+      # Rust
+      # -------------------------
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
 
+      # -------------------------
+      # Cargo cache
+      # -------------------------
       - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo
+            ~/.rustup
             target
           key: cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
 
 
+      # -------------------------
+      # Build workspace
+      # -------------------------
       - name: Build
+        shell: bash
         run: |
           cargo build \
+            --workspace \
             --release \
             --target ${{ matrix.target }}
 
 
+      # ==================================================
       # macOS InputMethodKit bundle
-      - name: Package macOS bundle
+      # ==================================================
+      - name: Package macOS
         if: matrix.target == 'aarch64-apple-darwin'
         shell: bash
         run: |
           mkdir -p dist
 
-          cp -r \
-            platform/macos/target/${{ matrix.target }}/release \
-            dist/
+          mkdir -p dist/ztap.app/Contents/MacOS
+
+          cp \
+            target/${{ matrix.target }}/release/ztap \
+            dist/ztap.app/Contents/MacOS/
+
+
+          cp \
+            platform/macos/Info.plist \
+            dist/ztap.app/Contents/
+
 
           tar czf \
             dist/${{ matrix.artifact }}.tar.gz \
-            -C dist release
+            -C dist \
+            ztap.app
 
 
-      # Windows DLL/exe
+
+      # ==================================================
+      # Windows TSF DLL
+      # ==================================================
       - name: Package Windows
         if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: bash
+        shell: pwsh
         run: |
-          mkdir dist
+
+          New-Item -ItemType Directory -Force dist | Out-Null
+
 
           Copy-Item `
             target/${{ matrix.target }}/release/*.dll `
             dist/ `
             -ErrorAction SilentlyContinue
 
+
           Copy-Item `
             target/${{ matrix.target }}/release/*.exe `
             dist/ `
             -ErrorAction SilentlyContinue
 
+
           Compress-Archive `
-            dist/* `
-            dist/${{ matrix.artifact }}.zip
+            -Path dist/* `
+            -DestinationPath dist/${{ matrix.artifact }}.zip
 
 
+
+      # -------------------------
+      # Upload artifacts
+      # -------------------------
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
