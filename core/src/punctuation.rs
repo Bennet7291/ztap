@@ -1,33 +1,7 @@
-//! Chinese punctuation mapping module.
-//!
-//! While Chinese input mode is active, ASCII punctuation keystrokes are mapped
-//! to their full-width Chinese equivalents.
-//!
-//! # Paired symbols
-//!
-//! Quotation marks (`"` and `'`) require left/right variants. [`PunctuationState`]
-//! tracks the open/close parity for each pair and alternates between them on each
-//! keystroke. All other mappings are stateless.
-//!
-//! # Example
-//!
-//! ```
-//! let mut state = PunctuationState::new();
-//! assert_eq!(state.map(','), Some("，"));
-//! assert_eq!(state.map('.'), Some("。"));
-//! assert_eq!(state.map('"'), Some("\u{201C}")); // left double quote "
-//! assert_eq!(state.map('"'), Some("\u{201D}")); // right double quote "
-//! assert_eq!(state.map('a'), None);             // not a punctuation key
-//! ```
-
-/// Stateful punctuation mapper.
-///
-/// Tracks whether the next double-quote or single-quote keystroke should
-/// produce an opening or closing quotation mark.
 pub struct PunctuationState {
-    /// `false` → next `"` produces left mark `"`, `true` → right mark `"`
+
     double_open: bool,
-    /// `false` → next `'` produces left mark `'`, `true` → right mark `'`
+
     single_open: bool,
 }
 
@@ -39,48 +13,38 @@ impl PunctuationState {
         }
     }
 
-    /// Reset quotation-mark parity.
-    ///
-    /// Call after committing or cancelling a composition so the next session
-    /// starts fresh with a left (opening) quote.
     pub fn reset(&mut self) {
         self.double_open = false;
         self.single_open = false;
     }
 
-    /// Map an ASCII character to its Chinese punctuation equivalent.
-    ///
-    /// Returns `None` if the character has no Chinese mapping; the caller
-    /// should pass the character through unchanged.
     pub fn map(&mut self, ascii: char) -> Option<&'static str> {
         match ascii {
-            // ── Stateless mappings ────────────────────────────────────────────
+
             ','  => Some("，"),
             '.'  => Some("。"),
             '!'  => Some("！"),
             '?'  => Some("？"),
             ';'  => Some("；"),
             ':'  => Some("："),
-            '\\' => Some("、"),   // enumeration comma (顿号); backslash key
+            '\\' => Some("、"),
             '('  => Some("（"),
             ')'  => Some("）"),
-            '<'  => Some("《"),   // book title mark open
-            '>'  => Some("》"),   // book title mark close
-            '`'  => Some("·"),    // middle dot (间隔号)
-            '-'  => Some("——"),   // em dash (破折号)
-            '^'  => Some("……"),   // ellipsis (省略号)
+            '<'  => Some("《"),
+            '>'  => Some("》"),
+            '`'  => Some("·"),
+            '-'  => Some("——"),
+            '^'  => Some("……"),
 
-            // ── Stateful paired mappings ──────────────────────────────────────
             '"' => {
                 // U+201C LEFT DOUBLE QUOTATION MARK "
-                // U+201D RIGHT DOUBLE QUOTATION MARK "
+
                 let s = if self.double_open { "\u{201D}" } else { "\u{201C}" };
                 self.double_open = !self.double_open;
                 Some(s)
             }
             '\'' => {
-                // U+2018 LEFT SINGLE QUOTATION MARK '
-                // U+2019 RIGHT SINGLE QUOTATION MARK '
+
                 let s = if self.single_open { "\u{2019}" } else { "\u{2018}" };
                 self.single_open = !self.single_open;
                 Some(s)
@@ -97,9 +61,6 @@ impl Default for PunctuationState {
     }
 }
 
-/// Return `true` if the given ASCII character has a Chinese punctuation mapping.
-///
-/// Stateless utility — does not distinguish left/right quotation marks.
 pub fn is_punctuation_key(ascii: char) -> bool {
     matches!(
         ascii,
@@ -135,7 +96,7 @@ mod tests {
     #[test]
     fn test_double_quote_alternation() {
         let mut s = PunctuationState::new();
-        assert_eq!(s.map('"'), Some("\u{201C}")); // "
+        assert_eq!(s.map('"'), Some("\u{201C}"));
         assert_eq!(s.map('"'), Some("\u{201D}")); // "
         assert_eq!(s.map('"'), Some("\u{201C}")); // " again
     }
@@ -143,8 +104,8 @@ mod tests {
     #[test]
     fn test_single_quote_alternation() {
         let mut s = PunctuationState::new();
-        assert_eq!(s.map('\''), Some("\u{2018}")); // '
-        assert_eq!(s.map('\''), Some("\u{2019}")); // '
+        assert_eq!(s.map('\''), Some("\u{2018}"));
+        assert_eq!(s.map('\''), Some("\u{2019}"));
     }
 
     #[test]
@@ -152,7 +113,7 @@ mod tests {
         let mut s = PunctuationState::new();
         s.map('"'); // advances to right-quote state
         s.reset();
-        assert_eq!(s.map('"'), Some("\u{201C}")); // back to left
+        assert_eq!(s.map('"'), Some("\u{201C}"));
     }
 
     #[test]

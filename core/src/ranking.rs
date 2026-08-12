@@ -1,35 +1,12 @@
-//! Candidate ranking module.
-//!
-//! Combines three signals to score each candidate entry:
-//!
-//! ```text
-//! score = base_freq   × W_BASE
-//!       + user_freq   × W_USER
-//!       + len_bonus   × W_LEN
-//! ```
-//!
-//! Weights are empirically chosen; they can be tuned or learned automatically later.
-
 use crate::dictionary::Entry;
 use crate::learning::LearningStore;
 
-// ── Weight constants ──────────────────────────────────────────────────────────
-
-/// Corpus frequency weight: the base signal.
 const W_BASE: f64 = 1.0;
 
-/// User selection frequency weight: one user pick counts for 12 corpus points,
-/// so personal preference quickly surfaces above default ordering.
 const W_USER: f64 = 12.0;
 
-/// Per-character length bonus: rewards longer word matches over single characters.
-/// Capped at 4 characters to avoid over-favouring very long phrases.
 const W_LEN: f64 = 5_000.0;
 
-/// Compute a composite score for a single dictionary entry.
-///
-/// - `entry`     — the candidate entry with its corpus frequency
-/// - `user_freq` — how many times the user has previously selected this word
 pub fn score(entry: &Entry, user_freq: u32) -> f64 {
     let base = entry.base_freq as f64 * W_BASE;
     let user = user_freq as f64 * W_USER;
@@ -38,9 +15,6 @@ pub fn score(entry: &Entry, user_freq: u32) -> f64 {
     base + user + len
 }
 
-/// Sort a candidate list in descending score order (best candidate first).
-///
-/// Mutates `entries` in place; after this call `entries[0]` is the top pick.
 pub fn rank(entries: &mut Vec<Entry>, store: &LearningStore) {
     entries.sort_by(|a, b| {
         let sa = score(a, store.user_freq(&a.word));
@@ -49,7 +23,6 @@ pub fn rank(entries: &mut Vec<Entry>, store: &LearningStore) {
     });
 }
 
-/// Sort and keep only the top `n` candidates (for the candidate window).
 pub fn rank_top(entries: &mut Vec<Entry>, store: &LearningStore, n: usize) {
     rank(entries, store);
     entries.truncate(n);
@@ -93,9 +66,8 @@ mod tests {
             make_entry("你好", &["ni", "hao"], 99_000),
         ];
         rank(&mut entries, &store);
-        // 10 user selections × W_USER(12) × 1 = 120 > base gap of ~98 000 — wait, let's
-        // just verify the API compiles and runs; threshold tuning is an integration concern.
-        let _ = entries[0].word.clone(); // result depends on weight constants
+
+        let _ = entries[0].word.clone();
     }
 
     #[test]
