@@ -1,0 +1,98 @@
+name: Build ztap
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: ztap-macos-aarch64
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: ztap-windows-x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo
+            target
+          key: cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+
+      - name: Build
+        run: |
+          cargo build \
+            --release \
+            --target ${{ matrix.target }}
+
+
+      # macOS InputMethodKit bundle
+      - name: Package macOS bundle
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          mkdir -p dist
+
+          cp -r \
+            platform/macos/target/${{ matrix.target }}/release \
+            dist/
+
+          tar czf \
+            dist/${{ matrix.artifact }}.tar.gz \
+            -C dist release
+
+
+      # Windows DLL/exe
+      - name: Package Windows
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          mkdir dist
+
+          Copy-Item `
+            target/${{ matrix.target }}/release/*.dll `
+            dist/ `
+            -ErrorAction SilentlyContinue
+
+          Copy-Item `
+            target/${{ matrix.target }}/release/*.exe `
+            dist/ `
+            -ErrorAction SilentlyContinue
+
+          Compress-Archive `
+            dist/* `
+            dist/${{ matrix.artifact }}.zip
+
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
