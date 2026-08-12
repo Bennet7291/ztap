@@ -1,41 +1,52 @@
 //! macOS candidate window.
 //!
-//! Rendered with a Cocoa NSPanel and CoreText. No cross-platform GUI
-//! framework is used.
+//! Rendered with a Cocoa NSPanel and plain `NSTextField` labels as
+//! subviews of its content view. No cross-platform GUI framework is used.
 //!
 //! # WARNING: UNTESTED -- see input_method.rs's module doc comment
 //!
-//! Written without a macOS/Xcode toolchain available; never compiled. Same
-//! caveats as input_method.rs apply, doubly so here: this file defines a
-//! *second* `define_class!`-based Objective-C class (the custom drawing
-//! NSView subclass), and the exact `#[unsafe(super(...))]` vs
-//! `#[unsafe(super = ...)]` attribute syntax objc2 expects has visibly
-//! drifted across versions in the reference material available while
-//! writing this (see the two different forms cited in
-//! objc2's own docs vs. its worked example) -- **check the installed
-//! objc2 version's own `define_class!` macro docs before assuming either
-//! form here is correct.**
-
-use std::cell::RefCell;
+//! Written without a macOS/Xcode toolchain available; never compiled.
+//!
+//! # Design history: why NSTextField instead of a custom CoreText view
+//!
+//! The original draft of this file defined a second `define_class!`-based
+//! Objective-C class (a custom `NSView` subclass overriding `drawRect:`)
+//! and drew candidate rows by hand with raw CoreGraphics/CoreText calls
+//! (`CGContext`, `CTFramesetter`, `CTFrame`). That approach produced a long
+//! chain of real CI build failures: `CGContextRef`/`CGRect`/`CGPoint`/
+//! `CGSize` do not live in `objc2_core_graphics` (they live in
+//! `objc2_core_foundation`, confirmed against that crate's own geometry.rs
+//! source and objc2-foundation's `NSRect`/`NSPoint`/`NSSize` type-alias
+//! re-exports); `CTFrame`/`CTFramesetter` were not at the crate root import
+//! path used; `kCTFontAttributeName` needed a different feature gate;
+//! `CFRange` lived in `objc2_core_foundation`, not `objc2_foundation`. Each
+//! fix surfaced the next, with no way to verify the whole chain without a
+//! real compiler.
+//!
+//! Rather than continue guessing at CoreGraphics/CoreText binding shapes
+//! this environment cannot verify, this rewrite follows objc2's own
+//! **official, published, verified-working example** (the "Hello World"
+//! AppKit app in https://docs.rs/objc2's crate-level docs, using
+//! `NSTextField::labelWithString` + `NSFont`/`NSColor`/`NSTextAlignment`)
+//! as closely as possible. This trades hand-drawn rounded corners and
+//! pixel-exact CoreText metrics (which the Windows Direct2D/DirectWrite
+//! implementation has) for a drastically smaller, better-grounded surface
+//! area: no custom NSView subclass, no CoreGraphics, no CoreText, just
+//! NSPanel + NSTextField, all of which appear verbatim in that official
+//! sample. `objc2-core-graphics` and `objc2-core-text` are no longer
+//! dependencies of this crate as a result -- see Cargo.toml.
 
 use objc2::rc::Retained;
-use objc2::runtime::{NSObjectProtocol, ProtocolObject};
-use objc2::{define_class, msg_send, AnyThread, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::{msg_send, AnyThread, MainThreadMarker};
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSFont, NSGraphicsContext, NSPanel, NSScreen, NSView,
-    NSWindowCollectionBehavior, NSWindowLevel, NSWindowStyleMask,
+    NSBackingStoreType, NSColor, NSFont, NSPanel, NSScreen, NSTextAlignment, NSTextField,
+    NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
-use objc2_core_graphics::{CGContextRef, CGRect};
-use objc2_core_text::{CTFont, CTFrame, CTFramesetter};
-use objc2_foundation::{
-    ns_string, NSAttributedString, NSDictionary, NSMutableAttributedString, NSPoint, NSRect,
-    NSSize, NSString,
-};
+use objc2_foundation::{ns_string, NSPoint, NSRect, NSSize, NSString};
 
-/// Padding, row height, font sizes in points (CoreText's native unit).
-/// Chosen to visually match the Windows candidate_window.rs constants
-/// (which use DIPs, a comparable "logical pixel" unit) so the two
-/// platforms look consistent.
+/// Padding, row height, font sizes in points. Chosen to visually match the
+/// Windows candidate_window.rs constants (which use DIPs, a comparable
+/// "logical pixel" unit) so the two platforms look consistent.
 const PADDING: f64 = 8.0;
 const ROW_HEIGHT: f64 = 24.0;
 const PREEDIT_ROW_HEIGHT: f64 = 20.0;
@@ -43,250 +54,25 @@ const INDEX_COLUMN_WIDTH: f64 = 20.0;
 const CANDIDATE_FONT_SIZE: f64 = 16.0;
 const INDEX_FONT_SIZE: f64 = 12.0;
 const PREEDIT_FONT_SIZE: f64 = 13.0;
-const CORNER_RADIUS: f64 = 6.0;
 
-/// Display state read by the custom view's `drawRect:` and written by
-/// `CandidateWindow::show`.
-#[derive(Default, Clone)]
-struct DisplayState {
-    preedit: String,
-    candidates: Vec<String>,
-    highlighted: usize,
-}
-
-struct ViewIvars {
-    display: RefCell<DisplayState>,
-}
-
-define_class!(
-    // SAFETY:
-    // - NSView (the superclass) has no subclassing requirements beyond the
-    //   usual AppKit expectation that drawing happens inside drawRect: on
-    //   the main thread, which #[thread_kind = MainThreadOnly] enforces at
-    //   the type level -- CandidateView cannot be constructed or touched
-    //   off the main thread, matching how every AppKit view must be used.
-    // - CandidateView does not implement Drop.
-    //
-    // CI-CONFIRMED FIX: `#[unsafe(super = NSView)]` (with `=`), not
-    // `#[unsafe(super(NSView))]` (with parens) -- every real example
-    // found (objc2's own docs.rs example, the hello_world_app.rs sample
-    // in objc2's repo) uses the `=` form; the `(...)` form used in the
-    // original draft of this file does not exist in the macro's actual
-    // grammar and was a guess made without a compiler available to check
-    // it against.
-    #[unsafe(super = NSView)]
-    #[thread_kind = MainThreadOnly]
-    #[name = "ZtapCandidateView"]
-    #[ivars = ViewIvars]
-    struct CandidateView;
-
-    // CI-CONFIRMED FIX: methods that override the superclass's own
-    // methods (drawRect:, isFlipped -- not a named delegate protocol)
-    // go in a plain `impl CandidateView { ... }` block, not
-    // `unsafe impl CandidateView { ... }`. `define_class!`'s method-block
-    // grammar is `unsafe impl $protocol:ident for $for:ty { ... }` for
-    // protocol conformance specifically; a block with no protocol name is
-    // a plain `impl`. This was the exact cause of CI's "no rules expected
-    // an opening brace" error pointing at this line. Confirmed against
-    // objc2's own docs.rs worked example (the
-    // `MyCustomObject`/`foo`/`myClassMethod` example), which uses exactly
-    // this plain-`impl` shape for arbitrary custom/overridden methods.
-    impl CandidateView {
-        #[unsafe(method(drawRect:))]
-        fn draw_rect(&self, _dirty_rect: NSRect) {
-            self.paint();
-        }
-
-        #[unsafe(method(isFlipped))]
-        fn is_flipped(&self) -> bool {
-            // Flipped coordinate system (origin top-left, y increases
-            // downward) makes the row-layout math in `paint` below match
-            // the Windows candidate_window.rs's top-down layout exactly,
-            // rather than needing a separate bottom-up formula here.
-            true
-        }
-    }
-
-    // Required on every define_class! type regardless of superclass, per
-    // every real example found -- even though NSObjectProtocol has no
-    // required methods, the impl block itself must be present.
-    unsafe impl NSObjectProtocol for CandidateView {}
-);
-
-impl CandidateView {
-    fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(ViewIvars {
-            display: RefCell::new(DisplayState::default()),
-        });
-        // SAFETY: NSView::initWithFrame: is the standard designated
-        // initializer; `this` is freshly allocated with ivars set above,
-        // satisfying define_class!'s expectation that ivars are
-        // initialized before the superclass init runs.
-        unsafe { msg_send![super(this), initWithFrame: frame] }
-    }
-
-    fn ivars(&self) -> &ViewIvars {
-        DefinedClass::ivars(self)
-    }
-
-    fn set_display(&self, display: DisplayState) {
-        *self.ivars().display.borrow_mut() = display;
-        // SAFETY: self is a valid NSView; setNeedsDisplay: is safe to call
-        // from the main thread, which #[thread_kind = MainThreadOnly]
-        // guarantees this method is only ever reached from.
-        unsafe {
-            let _: () = msg_send![self, setNeedsDisplay: true];
-        }
-    }
-
-    /// Draw the candidate list with CoreText. Called from `drawRect:`.
-    fn paint(&self) {
-        let display = self.ivars().display.borrow();
-
-        // SAFETY: NSGraphicsContext::currentContext is only meaningful
-        // inside a drawRect: call, which is exactly where `paint` is
-        // invoked from (see the `#[unsafe(method(drawRect:))]` impl above).
-        let Some(gc) = (unsafe { NSGraphicsContext::currentContext() }) else { return };
-        // SAFETY: `gc` is the live graphics context for this drawRect: call;
-        // CGContext is the CoreGraphics-level handle backing it.
-        let cg_ctx: *mut CGContextRef = unsafe { msg_send![&gc, CGContext] };
-        if cg_ctx.is_null() {
-            return;
-        }
-        let cg_ctx: &CGContextRef = unsafe { &*cg_ctx };
-
-        let bounds: NSRect = unsafe { msg_send![self, bounds] };
-        let w = bounds.size.width;
-        let h = bounds.size.height;
-
-        // Background + rounded border. CoreGraphics has no single
-        // "rounded rect" primitive call exposed simply here, so this
-        // approximates with a filled rect; a real implementation would
-        // build a CGPath with CGPathAddRoundedRect (or the manual
-        // arc-segment construction) for actual rounded corners -- left as
-        // a visual-polish gap rather than a functional one, since a
-        // square-cornered candidate window is a cosmetic downgrade, not a
-        // broken one.
-        unsafe {
-            cg_ctx.setFillColorWithColor(&objc2_core_graphics::CGColor::new_srgb(0.98, 0.98, 0.98, 1.0));
-            cg_ctx.fillRect(CGRect::new(objc2_core_graphics::CGPoint::new(0.0, 0.0), objc2_core_graphics::CGSize::new(w, h)));
-            cg_ctx.setStrokeColorWithColor(&objc2_core_graphics::CGColor::new_srgb(0.7, 0.7, 0.7, 1.0));
-            cg_ctx.setLineWidth(1.0);
-            cg_ctx.strokeRect(CGRect::new(
-                objc2_core_graphics::CGPoint::new(0.5, 0.5),
-                objc2_core_graphics::CGSize::new(w - 1.0, h - 1.0),
-            ));
-        }
-
-        let mut y = PADDING;
-
-        if !display.preedit.is_empty() {
-            draw_line(cg_ctx, &display.preedit, PADDING, y, w - PADDING * 2.0, PREEDIT_FONT_SIZE, (0.4, 0.4, 0.4));
-            y += PREEDIT_ROW_HEIGHT;
-        }
-
-        for (i, candidate) in display.candidates.iter().enumerate() {
-            let row_top = y;
-            if i == display.highlighted {
-                unsafe {
-                    cg_ctx.setFillColorWithColor(&objc2_core_graphics::CGColor::new_srgb(0.85, 0.91, 1.0, 1.0));
-                    cg_ctx.fillRect(CGRect::new(
-                        objc2_core_graphics::CGPoint::new(2.0, row_top),
-                        objc2_core_graphics::CGSize::new(w - 4.0, ROW_HEIGHT),
-                    ));
-                }
-            }
-
-            let index_label = format!("{}", (i + 1) % 10);
-            draw_line(cg_ctx, &index_label, PADDING, row_top + 4.0, INDEX_COLUMN_WIDTH, INDEX_FONT_SIZE, (0.55, 0.55, 0.55));
-            draw_line(
-                cg_ctx,
-                candidate,
-                PADDING + INDEX_COLUMN_WIDTH,
-                row_top + 3.0,
-                w - PADDING * 2.0 - INDEX_COLUMN_WIDTH,
-                CANDIDATE_FONT_SIZE,
-                (0.1, 0.1, 0.1),
-            );
-
-            y += ROW_HEIGHT;
-        }
-    }
-}
-
-/// Draw one line of text at `(x, y)` (top-left origin, since `isFlipped`
-/// returns true) using CoreText, constrained to `max_width`.
-///
-/// # WARNING: highest-uncertainty function in this file
-///
-/// Everything downstream of `objc2-core-graphics` and `objc2-core-text` in
-/// this function -- `CGColor::new_srgb`, `CGPath::with_rect`,
-/// `CTFont::with_name`, `CTFramesetter::with_attributed_string`, and the
-/// `CTFrame::draw` call -- was written from Apple's C-level CoreGraphics/
-/// CoreText API shape (`CGColorCreateGenericRGB`, `CGPathCreateWithRect`,
-/// `CTFontCreateWithName`, `CTFramesetterCreateWithAttributedString`,
-/// `CTFrameDraw`) translated into what seemed like the most plausible
-/// `objc2`-idiomatic Rust method names, *not* verified against
-/// `objc2-core-graphics`/`objc2-core-text`'s actual generated bindings --
-/// unlike `objc2-input-method-kit` and `objc2-app-kit` elsewhere in this
-/// port, this draft could not pull those two crates' real docs pages. Both
-/// crates are confirmed to exist and cover the right framework surface
-/// (CGColor, CGPath, CGContext are real feature-gated modules in
-/// objc2-core-graphics; see that crate's Cargo feature list), but the
-/// **exact method names and whether they're free functions vs.
-/// associated functions vs. `msg_send!`-style calls should be treated as
-/// a first guess, not a verified API.** Check
-/// `cargo doc --open -p objc2-core-graphics -p objc2-core-text` on a real
-/// build before trusting this function compiles as written; expect to
-/// rewrite most of its internals against the real signatures.
-fn draw_line(cg_ctx: &CGContextRef, text: &str, x: f64, y: f64, max_width: f64, font_size: f64, color: (f64, f64, f64)) {
-    // SAFETY: CTFontCreateWithName is a simple, always-safe CoreText
-    // factory function given a valid font name and size.
-    let font = unsafe { CTFont::with_name(ns_string!("Helvetica"), font_size, std::ptr::null()) };
-
-    let attr_string = NSMutableAttributedString::from_nsstring(&NSString::from_str(text));
-    let full_range = objc2_foundation::NSRange::new(0, attr_string.length());
-    unsafe {
-        attr_string.addAttribute_value_range(
-            objc2_core_text::kCTFontAttributeName,
-            &font,
-            full_range,
-        );
-    }
-
-    // SAFETY: `attr_string` is a valid, fully-initialized NSAttributedString
-    // built immediately above; CTFramesetterCreateWithAttributedString's
-    // only precondition is a non-null attributed string.
-    let framesetter = unsafe { CTFramesetter::with_attributed_string(&attr_string) };
-
-    let path_rect = CGRect::new(
-        objc2_core_graphics::CGPoint::new(x, y),
-        objc2_core_graphics::CGSize::new(max_width.max(1.0), font_size * 1.4),
-    );
-    // SAFETY: path_rect has finite, positive dimensions per the max(1.0)
-    // clamp above; CGPathCreateWithRect's only precondition.
-    let path = unsafe { objc2_core_graphics::CGPath::with_rect(path_rect, std::ptr::null()) };
-
-    // SAFETY: framesetter and path are both valid, freshly constructed
-    // above; CTFramesetterCreateFrame's documented contract requires only
-    // that both arguments be non-null, which they are here.
-    let frame = unsafe { framesetter.create_frame(objc2_foundation::CFRange::new(0, 0), &path, None) };
-
-    let _ = color; // TODO: apply `color` via a foreground-color attribute
-                   // on `attr_string` above (kCTForegroundColorAttributeName)
-                   // rather than being accepted-and-ignored here -- left as
-                   // a visual-fidelity gap (text will render in CoreText's
-                   // default black) rather than a functional one.
-
-    unsafe {
-        frame.draw(cg_ctx);
-    }
+/// One row's pair of labels (index number + candidate word), or just the
+/// preedit label -- kept so `show()` can reuse/reposition existing
+/// `NSTextField`s across calls instead of tearing down and recreating the
+/// whole subview tree on every keystroke.
+struct Row {
+    index_label: Retained<NSTextField>,
+    word_label: Retained<NSTextField>,
 }
 
 /// Floating candidate panel.
 pub struct CandidateWindow {
     panel: Retained<NSPanel>,
-    view: Retained<CandidateView>,
+    mtm: MainThreadMarker,
+    preedit_label: Retained<NSTextField>,
+    /// Pool of row label pairs, grown on demand and reused across `show()`
+    /// calls; rows beyond the current candidate count are hidden rather
+    /// than removed, avoiding subview churn on every keystroke.
+    rows: std::cell::RefCell<Vec<Row>>,
 }
 
 impl CandidateWindow {
@@ -302,12 +88,14 @@ impl CandidateWindow {
         // the Err path exists so a violated assumption surfaces as a
         // handled error (see ensure_session's `.ok()` fallback) rather
         // than an AppKit assertion crash deep in this function.
-        let mtm = objc2::MainThreadMarker::new().ok_or(())?;
+        let mtm = MainThreadMarker::new().ok_or(())?;
 
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(100.0, 100.0));
         // SAFETY: NSPanel::initWithContentRect:styleMask:backing:defer: is
-        // the standard NSWindow/NSPanel designated initializer; all
-        // arguments are plain values with no aliasing/lifetime concerns.
+        // the standard NSWindow/NSPanel designated initializer, matching
+        // the pattern objc2's own docs.rs sample uses for NSWindow's
+        // equivalent initializer; all arguments are plain values with no
+        // aliasing/lifetime concerns.
         let panel: Retained<NSPanel> = unsafe {
             let alloc = NSPanel::alloc(mtm);
             msg_send![
@@ -319,17 +107,32 @@ impl CandidateWindow {
             ]
         };
 
-        // isOpaque = NO + clearColor background is what makes the rounded
-        // corners drawn in CandidateView::paint actually show as rounded
-        // (rather than square-clipped by an opaque window background) --
-        // same rationale as the Windows side's layered/borderless window.
+        // isOpaque = NO + clearColor background: an un-bordered panel with
+        // no chrome, like every other CJK IME candidate window. No rounded
+        // corners in this rewrite (see module doc comment) -- a plain
+        // rectangular panel is a cosmetic downgrade from the original
+        // hand-drawn-rounded-rect draft, not a functional one.
         unsafe {
             let _: () = msg_send![&panel, setOpaque: false];
             let clear = NSColor::clearColor();
             let _: () = msg_send![&panel, setBackgroundColor: &*clear];
             // NSPopUpMenuWindowLevel: floats above normal app windows,
             // matching Windows' WS_EX_TOPMOST.
-            let _: () = msg_send![&panel, setLevel: NSWindowLevel::PopUpMenu];
+            //
+            // WARNING: `NSWindowLevel` is an `isize` type alias, not an
+            // enum (confirmed by CI: "no associated function or constant
+            // named PopUpMenu found for type isize" when this was written
+            // as `NSWindowLevel::PopUpMenu`). The classic Objective-C
+            // constant is `NSPopUpMenuWindowLevel`, a free-standing
+            // constant at the crate root -- used here on that basis, but
+            // this specific name has not been confirmed against
+            // objc2-app-kit's actual generated bindings (unlike most other
+            // fixes in this file, which trace directly to a CI error
+            // message). If this doesn't resolve, the raw numeric level
+            // (101, per Apple's <NSWindow.h> `NSPopUpMenuWindowLevel`
+            // definition) via `NSWindowLevel::from(101)` or a plain
+            // integer literal is the fallback.
+            let _: () = msg_send![&panel, setLevel: objc2_app_kit::NSPopUpMenuWindowLevel];
             // Follow the active Space (desktop) rather than being pinned to
             // whichever Space existed when the panel was first shown.
             let _: () = msg_send![
@@ -342,12 +145,22 @@ impl CandidateWindow {
             let _: () = msg_send![&panel, setBecomesKeyOnlyIfNeeded: true];
         }
 
-        let view = CandidateView::new(mtm, frame);
+        let preedit_label = make_label(mtm, PREEDIT_FONT_SIZE, 0.4, 0.4, 0.4);
         unsafe {
-            let _: () = msg_send![&panel, setContentView: &*view];
+            let _: () = msg_send![&preedit_label, setHidden: true];
         }
 
-        Ok(CandidateWindow { panel, view })
+        let content_view = panel.contentView().expect("NSPanel must have a content view");
+        unsafe {
+            content_view.addSubview(&preedit_label);
+        }
+
+        Ok(CandidateWindow {
+            panel,
+            mtm,
+            preedit_label,
+            rows: std::cell::RefCell::new(Vec::new()),
+        })
     }
 
     /// Show the panel with `preedit`/`candidates`, positioned from
@@ -355,11 +168,7 @@ impl CandidateWindow {
     /// `firstRectForCharacterRange:actualRange:` -- see
     /// `input_method.rs::client_first_rect`).
     pub fn show(&self, preedit: &str, candidates: &[String], highlighted: usize, anchor: NSRect) {
-        self.view.set_display(DisplayState {
-            preedit: preedit.to_string(),
-            candidates: candidates.to_vec(),
-            highlighted,
-        });
+        let content_view = self.panel.contentView().expect("NSPanel must have a content view");
 
         let (width, height) = self.measure(preedit, candidates);
 
@@ -367,12 +176,12 @@ impl CandidateWindow {
         // every macOS CJK IME uses), clamped to the containing screen's
         // visible frame so the panel never renders partly off-screen.
         let mut origin = NSPoint::new(anchor.origin.x, anchor.origin.y - height);
-        // SAFETY: NSScreen::mainScreen() is always safe to call; may
-        // legitimately return None if no screen is attached (headless CI,
-        // extremely rare on a real desktop), handled by the `if let` below
-        // rather than unwrapped.
-        if let Some(screen) = unsafe { NSScreen::mainScreen() } {
-            let visible: NSRect = unsafe { msg_send![&screen, visibleFrame] };
+        // SAFETY: NSScreen::mainScreen(mtm) is always safe to call with a
+        // valid MainThreadMarker; may legitimately return None if no
+        // screen is attached (headless CI, extremely rare on a real
+        // desktop), handled by the `if let` below rather than unwrapped.
+        if let Some(screen) = NSScreen::mainScreen(self.mtm) {
+            let visible = screen.visibleFrame();
             let max_x = visible.origin.x + visible.size.width - width;
             let max_y = visible.origin.y + visible.size.height - height;
             origin.x = origin.x.clamp(visible.origin.x, max_x.max(visible.origin.x));
@@ -380,8 +189,96 @@ impl CandidateWindow {
         }
 
         let new_frame = NSRect::new(origin, NSSize::new(width, height));
+        // NOTE: every AppKit mutation call below is wrapped in `unsafe {}`
+        // uniformly, even where a given setter might actually be a safe
+        // fn in this binding version -- an unnecessary `unsafe` block is
+        // only ever a warning (see lib.rs's own CI-reported warnings of
+        // exactly this kind), never a hard error, whereas guessing a call
+        // is safe when the binding actually marks it `unsafe fn` is a hard
+        // compile error. Consistently over-wrapping here is the safer
+        // default given this file could not be checked against a
+        // compiler; unwind this once real `cargo build` output confirms
+        // which calls don't need it.
         unsafe {
             let _: () = msg_send![&self.panel, setFrame: new_frame, display: true];
+        }
+
+        // Layout is top-down in *panel-local* coordinates with y=0 at the
+        // top (AppKit views are bottom-left-origin by default and this
+        // panel's content view is not flipped, so each row's y is
+        // `height - PADDING - row_top_from_top - row_height`).
+        let mut y_from_top = PADDING;
+
+        if !preedit.is_empty() {
+            unsafe {
+                self.preedit_label.setStringValue(&NSString::from_str(preedit));
+                let _: () = msg_send![&self.preedit_label, setHidden: false];
+            }
+            let label_y = height - y_from_top - PREEDIT_ROW_HEIGHT;
+            unsafe {
+                self.preedit_label.setFrame(NSRect::new(
+                    NSPoint::new(PADDING, label_y),
+                    NSSize::new(width - PADDING * 2.0, PREEDIT_ROW_HEIGHT),
+                ));
+            }
+            y_from_top += PREEDIT_ROW_HEIGHT;
+        } else {
+            unsafe {
+                let _: () = msg_send![&self.preedit_label, setHidden: true];
+            }
+        }
+
+        self.ensure_row_count(candidates.len(), &content_view);
+        let rows = self.rows.borrow();
+        for (i, candidate) in candidates.iter().enumerate() {
+            let row = &rows[i];
+            let row_y = height - y_from_top - ROW_HEIGHT;
+
+            let index_text = format!("{}", (i + 1) % 10);
+            unsafe {
+                row.index_label.setStringValue(&NSString::from_str(&index_text));
+                row.word_label.setStringValue(&NSString::from_str(candidate));
+                let _: () = msg_send![&row.index_label, setHidden: false];
+                let _: () = msg_send![&row.word_label, setHidden: false];
+            }
+            unsafe {
+                row.index_label.setFrame(NSRect::new(
+                    NSPoint::new(PADDING, row_y),
+                    NSSize::new(INDEX_COLUMN_WIDTH, ROW_HEIGHT),
+                ));
+                row.word_label.setFrame(NSRect::new(
+                    NSPoint::new(PADDING + INDEX_COLUMN_WIDTH, row_y),
+                    NSSize::new(width - PADDING * 2.0 - INDEX_COLUMN_WIDTH, ROW_HEIGHT),
+                ));
+            }
+
+            // Highlight the selected row's background. NSTextField has no
+            // simple per-instance background-fill-only mode without also
+            // needing setBezeled/setDrawsBackground plumbing per row; a
+            // subtle text-color change stands in for the highlight instead
+            // (matching the Windows implementation's own filled-rectangle
+            // highlight would need a separate background NSView per row --
+            // left as a visual-polish gap, not a functional one, since the
+            // highlighted candidate is still distinguishable by index
+            // alone).
+            let (r, g, b) = if i == highlighted { (0.05, 0.05, 0.4) } else { (0.1, 0.1, 0.1) };
+            unsafe {
+                let color = NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0);
+                row.word_label.setTextColor(Some(&color));
+            }
+
+            y_from_top += ROW_HEIGHT;
+        }
+        // Hide any pooled rows beyond the current candidate count.
+        for row in rows.iter().skip(candidates.len()) {
+            unsafe {
+                let _: () = msg_send![&row.index_label, setHidden: true];
+                let _: () = msg_send![&row.word_label, setHidden: true];
+            }
+        }
+        drop(rows);
+
+        unsafe {
             let _: () = msg_send![&self.panel, orderFront: std::ptr::null::<objc2::runtime::AnyObject>()];
         }
     }
@@ -394,19 +291,38 @@ impl CandidateWindow {
         }
     }
 
-    /// Measure the space needed for `preedit`/`candidates` using CoreText
-    /// line metrics, so the panel is sized to content rather than a fixed
-    /// guess -- same rationale as the Windows side's `measure` method.
+    /// Grow the row pool (adding new `NSTextField` subviews) if fewer than
+    /// `count` rows currently exist. Never shrinks the pool -- excess rows
+    /// are hidden by the caller (`show`, above) instead, so repeatedly
+    /// showing a shrinking-then-growing candidate list doesn't churn
+    /// subviews on every keystroke.
+    fn ensure_row_count(&self, count: usize, content_view: &Retained<NSView>) {
+        let mut rows = self.rows.borrow_mut();
+        while rows.len() < count {
+            let index_label = make_label(self.mtm, INDEX_FONT_SIZE, 0.55, 0.55, 0.55);
+            let word_label = make_label(self.mtm, CANDIDATE_FONT_SIZE, 0.1, 0.1, 0.1);
+            unsafe {
+                content_view.addSubview(&index_label);
+                content_view.addSubview(&word_label);
+            }
+            rows.push(Row { index_label, word_label });
+        }
+    }
+
+    /// Measure the space needed for `preedit`/`candidates`.
     ///
     /// NOTE: this is a simplified width estimate (character count × a
-    /// fixed average advance) rather than a true CTLine-measured width,
+    /// fixed average advance) rather than a true glyph-measured width,
     /// unlike the Windows implementation's exact DirectWrite
-    /// `GetMetrics()` call. A more faithful port would lay out each
-    /// candidate string with `CTLineCreateWithAttributedString` +
-    /// `CTLineGetTypographicBounds` and take the max, mirroring
-    /// `candidate_window.rs::measure` on Windows exactly; left as a
-    /// follow-up since an approximate width still produces a usable
-    /// (if imperfectly sized) window rather than a broken one.
+    /// `GetMetrics()` call -- `NSTextField`/`NSAttributedString` do
+    /// support real size-to-fit measurement
+    /// (`NSString.boundingRectWithSize:options:attributes:`), but this
+    /// draft did not have a verified binding path for that call available
+    /// to check against a compiler (the same category of risk that
+    /// motivated moving off hand-rolled CoreText entirely -- see the
+    /// module doc comment). An approximate width still produces a usable
+    /// (if imperfectly sized) window rather than a broken one; revisit
+    /// once building against a real toolchain.
     fn measure(&self, preedit: &str, candidates: &[String]) -> (f64, f64) {
         let longest_chars = candidates
             .iter()
@@ -430,4 +346,24 @@ impl CandidateWindow {
 
         (width, height)
     }
+}
+
+/// Build one non-editable, non-bordered `NSTextField` label, matching the
+/// construction sequence in objc2's own verified docs.rs "Hello World"
+/// sample (`NSTextField::labelWithString` + `setTextColor` +
+/// `setFont`/`NSFont::systemFontOfSize`).
+fn make_label(mtm: MainThreadMarker, font_size: f64, r: f64, g: f64, b: f64) -> Retained<NSTextField> {
+    // SAFETY: NSTextField::labelWithString is a simple, safe AppKit
+    // convenience constructor per objc2's own sample usage; ns_string!("")
+    // is a valid empty compile-time NSString literal.
+    let label = unsafe { NSTextField::labelWithString(ns_string!(""), mtm) };
+    unsafe {
+        let color = NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0);
+        label.setTextColor(Some(&color));
+        label.setAlignment(NSTextAlignment::Left);
+        let font = NSFont::systemFontOfSize(font_size);
+        label.setFont(Some(&font));
+        let _: () = msg_send![&label, setHidden: true];
+    }
+    label
 }
