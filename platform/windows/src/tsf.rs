@@ -59,7 +59,7 @@
 use std::cell::RefCell;
 
 use windows::core::{implement, Result, GUID, HRESULT};
-use windows::Win32::Foundation::{BOOL, E_FAIL, LPARAM, WPARAM};
+use windows::Win32::Foundation::{E_FAIL, LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_BACK, VK_ESCAPE, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SPACE,
 };
@@ -68,8 +68,12 @@ use windows::Win32::UI::TextServices::{
     ITfContextComposition, ITfEditSession, ITfEditSession_Impl, ITfInsertAtSelection,
     ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfRange, ITfTextInputProcessor,
     ITfTextInputProcessor_Impl, ITfThreadMgr, TF_ANCHOR_END, TF_ES_READWRITE, TF_ES_SYNC,
-    TF_INSERT_TEXT_AT_SELECTION_FLAGS,
+    INSERT_TEXT_AT_SELECTION_FLAGS,
 };
+// windows-core 0.62 moved BOOL here (it is no longer re-exported at
+// windows::Win32::Foundation::BOOL) -- see Cargo.toml's fix-history note 2
+// for why windows_core is a direct dependency of this crate at all.
+use windows_core::{BOOL, Ref};
 
 use ztap_core::{Dictionary, Entry, InputSession, LearningStore};
 
@@ -369,7 +373,7 @@ impl ZtapTextService {
                 let insert: ITfInsertAtSelection = ctx.cast()?;
                 let _range: ITfRange = insert.InsertTextAtSelection(
                     cookie,
-                    TF_INSERT_TEXT_AT_SELECTION_FLAGS(0),
+                    INSERT_TEXT_AT_SELECTION_FLAGS(0),
                     &text_utf16,
                 )?;
             }
@@ -450,7 +454,7 @@ impl ZtapTextService {
                 let insert_sel: ITfInsertAtSelection = ctx.cast()?;
                 let anchor: ITfRange = insert_sel.InsertTextAtSelection(
                     cookie,
-                    TF_INSERT_TEXT_AT_SELECTION_FLAGS(0),
+                    INSERT_TEXT_AT_SELECTION_FLAGS(0),
                     &[],
                 )?;
                 let comp_services: ITfContextComposition = ctx.cast()?;
@@ -530,8 +534,8 @@ impl ITfTextInputProcessor_Impl for ZtapTextService_Impl {
     /// Called by TSF when the user's language profile activates this
     /// service. This is where all real initialization happens -- see
     /// ZtapTextService::new's doc comment for why it's not done eagerly.
-    fn Activate(&self, ptim: Option<&ITfThreadMgr>, tid: u32) -> Result<()> {
-        let Some(thread_mgr) = ptim else {
+    fn Activate(&self, ptim: Ref<'_, ITfThreadMgr>, tid: u32) -> Result<()> {
+        let Some(thread_mgr) = ptim.as_ref() else {
             return Err(E_FAIL.into());
         };
 
@@ -641,8 +645,8 @@ impl ITfKeyEventSink_Impl for ZtapTextService_Impl {
     /// consume -- see its TODO), but never under-reports, which is the
     /// safer direction to be wrong in for a "should I intercept this key"
     /// check.
-    fn OnTestKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
-        let Some(_context) = pic else { return Ok(BOOL(0)) };
+    fn OnTestKeyDown(&self, pic: Ref<'_, ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+        let Some(_context) = pic.as_ref() else { return Ok(BOOL(0)) };
         let vk = wparam.0 as u16;
         let has_composition = self
             .state
@@ -660,22 +664,22 @@ impl ITfKeyEventSink_Impl for ZtapTextService_Impl {
         Ok(BOOL(maybe_consumed as i32))
     }
 
-    fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
-        let Some(context) = pic else { return Ok(BOOL(0)) };
+    fn OnKeyDown(&self, pic: Ref<'_, ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+        let Some(context) = pic.as_ref() else { return Ok(BOOL(0)) };
         let consumed = self.on_key_down(context, wparam.0 as u32)?;
         Ok(BOOL(consumed as i32))
     }
 
-    fn OnTestKeyUp(&self, _pic: Option<&ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+    fn OnTestKeyUp(&self, _pic: Ref<'_, ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
         // Ztap acts entirely on key-down; key-up is never consumed.
         Ok(BOOL(0))
     }
 
-    fn OnKeyUp(&self, _pic: Option<&ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+    fn OnKeyUp(&self, _pic: Ref<'_, ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
         Ok(BOOL(0))
     }
 
-    fn OnPreservedKey(&self, _pic: Option<&ITfContext>, _rguid: *const GUID) -> Result<BOOL> {
+    fn OnPreservedKey(&self, _pic: Ref<'_, ITfContext>, _rguid: *const GUID) -> Result<BOOL> {
         // Ztap doesn't register any preserved (hotkey) key combinations.
         Ok(BOOL(0))
     }
@@ -694,7 +698,7 @@ impl ITfCompositionSink_Impl for ZtapTextService_Impl {
     /// it again -- it's already gone -- and reset the pinyin buffer so the
     /// next keystroke starts a fresh composition instead of silently
     /// continuing to append to now-orphaned state.
-    fn OnCompositionTerminated(&self, _ecwrite: u32, _pcomposition: Option<&ITfComposition>) -> Result<()> {
+    fn OnCompositionTerminated(&self, _ecwrite: u32, _pcomposition: Ref<'_, ITfComposition>) -> Result<()> {
         let mut state = self.state.borrow_mut();
         state.composition = None;
         if let Some(session) = state.session.as_mut() {
