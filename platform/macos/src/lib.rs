@@ -80,12 +80,12 @@ pub fn run() {
     // pool-scope process like an IME's main(), but worth fixing properly.
 
     let bundle = NSBundle::mainBundle();
-    let connection_name: Option<Retained<NSString>> = unsafe {
-        let key = NSString::from_str("InputMethodConnectionName");
-        bundle
-            .objectForInfoDictionaryKey(&key)
-            .and_then(|obj| obj.downcast::<NSString>().ok())
-    };
+    // CI-CONFIRMED FIX: this unsafe block was unnecessary --
+    // objectForInfoDictionaryKey is a safe fn in this binding version.
+    let key = NSString::from_str("InputMethodConnectionName");
+    let connection_name: Option<Retained<NSString>> = bundle
+        .objectForInfoDictionaryKey(&key)
+        .and_then(|obj| obj.downcast::<NSString>().ok());
     let bundle_identifier = bundle.bundleIdentifier();
 
     // WARNING: IMKServer's initializer signature (argument order,
@@ -115,8 +115,7 @@ pub fn run() {
     // menu bar -- see Info.plist's LSUIElement key, set to true for exactly
     // this reason).
     let app = NSApplication::sharedApplication(mtm);
-    // SAFETY: run() blocks until the application is asked to terminate;
-    // standard AppKit main-loop entry, safe to call once from the main
-    // thread after sharedApplication() above.
-    unsafe { app.run() };
+    // CI-CONFIRMED FIX: run() is a safe fn in this binding version; the
+    // unsafe block was unnecessary.
+    app.run();
 }
