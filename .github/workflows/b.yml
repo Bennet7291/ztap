@@ -1,137 +1,149 @@
-name: Build ztap
+# 构建 Ztap 的 macOS (aarch64) 与 Windows (x64) 产物。
+#
+# ⚠️ 重要提示：platform/windows 和 platform/macos 下的代码是在没有
+# Windows / macOS 工具链的环境中编写的，从未实际编译通过（详见各源文件
+# 顶部的 "WARNING: UNTESTED" 说明）。这个工作流大概率会在第一次运行时
+# 报错——这是预期之中的，请把 CI 的报错信息当作首轮编译反馈来修正代码，
+# 而不是假设 workflow 本身配置有误。
+#
+# 产物说明：
+#   - Windows 侧 (ztap-windows) 是一个 cdylib，产物是 ztap_windows.dll
+#     （TSF 文本服务必须是 DLL，不存在 .exe 形式——它由系统文本服务框架
+#     加载，而不是独立运行）。你要求的 "windows-x64.exe" 按此拆分为
+#     "windows-x64" 这个 job／产物名，内容物是 .dll，job 摘要里会注明。
+#   - macOS 侧 (ztap-macos) 是一个 [[bin]] 目标，产物是名为 Ztap 的可执行
+#     文件，还需要手动打包进 .app bundle（拷贝 Info.plist、设置可执行权限）
+#     才能安装到 ~/Library/Input Methods/ 下——具体步骤见
+#     platform/macos/src/lib.rs 顶部注释。这个 workflow 只负责编译出
+#     Ztap 二进制并连同 Info.plist 一并打包上传，bundle 的最终装配
+#     （代码签名、entitlements 等）留给使用者在本地完成。
+
+name: Build
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: write
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact: ztap-macos-aarch64
-
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: ztap-windows-x64
-
-    runs-on: ${{ matrix.os }}
-
+  # ── Windows x64: ztap-windows (cdylib, ztap_windows.dll) ────────────────
+  windows-x64:
+    name: windows-x64 (ztap_windows.dll)
+    runs-on: windows-latest
     steps:
-
-      # -------------------------
-      # Checkout
-      # -------------------------
-      - name: Checkout
+      - name: 检出代码
         uses: actions/checkout@v4
 
-
-      # -------------------------
-      # Rust
-      # -------------------------
-      - name: Install Rust
+      - name: 安装 Rust (x86_64-pc-windows-msvc)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-pc-windows-msvc
 
-
-      # -------------------------
-      # Cargo cache
-      # -------------------------
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: 缓存 cargo 依赖与构建产物
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo
-            ~/.rustup
-            target
-          key: cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          workspaces: ztap -> target
+          key: windows-x64
 
-
-      # -------------------------
-      # Build workspace
-      # -------------------------
-      - name: Build
-        shell: bash
+      # windows-rs 需要 Windows SDK 才能解析 TSF / Direct2D / DirectWrite
+      # 等 Win32 头文件对应的类型；windows-latest runner 自带 SDK，无需
+      # 额外安装步骤，此处保留一个显式校验步骤，方便未来排查环境问题。
+      - name: 校验工具链
         run: |
-          cargo build \
-            --workspace \
-            --release \
-            --target ${{ matrix.target }}
+          rustc --version
+          cargo --version
 
+      - name: cargo build -p ztap-windows --release
+        working-directory: ztap
+        run: cargo build -p ztap-windows --release --target x86_64-pc-windows-msvc
 
-      # ==================================================
-      # macOS InputMethodKit bundle
-      # ==================================================
-      - name: Package macOS
-        if: matrix.target == 'aarch64-apple-darwin'
-        shell: bash
-        run: |
-          mkdir -p dist
+      - name: 运行 ztap-core 单元测试（平台无关，未标记为 UNTESTED 的部分）
+        working-directory: ztap
+        run: cargo test -p ztap-core --release --target x86_64-pc-windows-msvc
 
-          mkdir -p dist/ztap.app/Contents/MacOS
-
-          cp \
-            target/${{ matrix.target }}/release/ztap \
-            dist/ztap.app/Contents/MacOS/
-
-
-          cp \
-            platform/macos/Info.plist \
-            dist/ztap.app/Contents/
-
-
-          tar czf \
-            dist/${{ matrix.artifact }}.tar.gz \
-            -C dist \
-            ztap.app
-
-
-
-      # ==================================================
-      # Windows TSF DLL
-      # ==================================================
-      - name: Package Windows
-        if: matrix.target == 'x86_64-pc-windows-msvc'
+      - name: 定位并整理产物
+        working-directory: ztap
         shell: pwsh
         run: |
+          $dll = Get-ChildItem -Path "target/x86_64-pc-windows-msvc/release" -Filter "ztap_windows.dll" -Recurse | Select-Object -First 1
+          if (-not $dll) {
+            Write-Error "未找到 ztap_windows.dll，构建可能失败或输出路径已变化"
+            exit 1
+          }
+          New-Item -ItemType Directory -Force -Path "dist/windows-x64" | Out-Null
+          Copy-Item $dll.FullName "dist/windows-x64/ztap_windows.dll"
+          # PDB 便于后续用 WinDbg/Visual Studio 调试首次编译/运行时的问题。
+          $pdb = Get-ChildItem -Path "target/x86_64-pc-windows-msvc/release" -Filter "ztap_windows.pdb" -Recurse | Select-Object -First 1
+          if ($pdb) {
+            Copy-Item $pdb.FullName "dist/windows-x64/ztap_windows.pdb"
+          }
 
-          New-Item -ItemType Directory -Force dist | Out-Null
-
-
-          Copy-Item `
-            target/${{ matrix.target }}/release/*.dll `
-            dist/ `
-            -ErrorAction SilentlyContinue
-
-
-          Copy-Item `
-            target/${{ matrix.target }}/release/*.exe `
-            dist/ `
-            -ErrorAction SilentlyContinue
-
-
-          Compress-Archive `
-            -Path dist/* `
-            -DestinationPath dist/${{ matrix.artifact }}.zip
-
-
-
-      # -------------------------
-      # Upload artifacts
-      # -------------------------
-      - name: Upload artifact
+      - name: 上传产物 (windows-x64)
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: dist/*
+          name: ztap-windows-x64
+          path: ztap/dist/windows-x64/
+          if-no-files-found: error
+
+  # ── macOS aarch64: ztap-macos ([[bin]] Ztap + Info.plist) ────────────────
+  macos-aarch64:
+    name: macos-aarch64 (Ztap + Info.plist)
+    runs-on: macos-14 # Apple Silicon runner
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust (aarch64-apple-darwin)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: 缓存 cargo 依赖与构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ztap -> target
+          key: macos-aarch64
+
+      - name: 校验工具链与 Xcode
+        run: |
+          rustc --version
+          cargo --version
+          xcodebuild -version
+
+      - name: cargo build -p ztap-macos --release
+        working-directory: ztap
+        run: cargo build -p ztap-macos --release --target aarch64-apple-darwin
+
+      - name: 运行 ztap-core 单元测试（平台无关，未标记为 UNTESTED 的部分）
+        working-directory: ztap
+        run: cargo test -p ztap-core --release --target aarch64-apple-darwin
+
+      # 只组装出未签名的 .app 目录结构（可执行文件 + Info.plist），
+      # 不做代码签名/entitlements——沙盒关闭等打包步骤见
+      # platform/macos/src/lib.rs 顶部注释，需要使用者在本地用真实的
+      # Apple 开发者证书完成。
+      - name: 组装未签名的 Ztap.app（不含代码签名）
+        working-directory: ztap
+        run: |
+          set -euo pipefail
+          BIN="target/aarch64-apple-darwin/release/Ztap"
+          if [ ! -f "$BIN" ]; then
+            echo "未找到编译产物 $BIN，构建可能失败或输出路径已变化" >&2
+            exit 1
+          fi
+          APP="dist/macos-aarch64/Ztap.app"
+          mkdir -p "$APP/Contents/MacOS"
+          cp "$BIN" "$APP/Contents/MacOS/Ztap"
+          chmod +x "$APP/Contents/MacOS/Ztap"
+          cp platform/macos/Info.plist "$APP/Contents/Info.plist"
+
+      - name: 上传产物 (macos-aarch64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ztap-macos-aarch64
+          path: ztap/dist/macos-aarch64/
+          if-no-files-found: error
