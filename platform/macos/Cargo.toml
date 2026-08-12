@@ -27,7 +27,12 @@ ztap-core = { path = "../../core" }
 #      example), which needs neither crate -- see that file's module doc
 #      comment for the full rationale.
 #   2. NSTextField (for the rewrite above) added to objc2-app-kit's feature
-#      list, along with NSTextAlignment (used to left-align candidate text).
+#      list. NSTextAlignment (used to left-align candidate text) is not a
+#      standalone Cargo feature -- CI's error printed the full valid
+#      feature list, confirming `setAlignment` (an NSTextField/
+#      NSSegmentedControl setter, per objc2-app-kit's own generated docs)
+#      is gated behind the general "NSText" feature instead; the
+#      NSTextAlignment *type* itself ships as part of that. Swapped below.
 objc2 = { version = "0.6", features = ["relax-void-encoding"] }
 objc2-foundation = { version = "0.3", features = [
     "NSString", "NSArray", "NSDictionary", "NSAttributedString",
@@ -35,7 +40,7 @@ objc2-foundation = { version = "0.3", features = [
 ] }
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication", "NSResponder", "NSWindow", "NSPanel", "NSView",
-    "NSColor", "NSFont", "NSScreen", "NSTextField", "NSTextAlignment",
+    "NSColor", "NSFont", "NSScreen", "NSTextField", "NSText",
     "NSGraphics", "NSWindowRestoration",
 ] }
 objc2-input-method-kit = { version = "0.3", features = [
