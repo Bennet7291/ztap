@@ -196,7 +196,7 @@ impl ZtapTextService {
             }
             Ok(())
         });
-        run_edit_session(&session, client_id)?;
+        run_edit_session(session, client_id)?;
 
         self.end_composition(context)?;
         Ok(())
@@ -223,7 +223,7 @@ impl ZtapTextService {
             }
             Ok(())
         });
-        run_edit_session(&session, client_id)
+        run_edit_session(session, client_id)
     }
 
     fn start_composition(&self, context: &ITfContext, client_id: u32) -> Result<()> {
@@ -245,7 +245,7 @@ impl ZtapTextService {
             }
             Ok(())
         });
-        run_edit_session(&session, client_id)?;
+        run_edit_session(session, client_id)?;
 
         let Some(composition) = created.borrow_mut().take() else {
             return Err(E_FAIL.into());
@@ -263,11 +263,11 @@ impl ZtapTextService {
         let session = EditSessionImpl::new(context.clone(), move |cookie, _ctx| {
             unsafe { comp_state.composition.EndComposition(cookie) }
         });
-        run_edit_session(&session, client_id)
+        run_edit_session(session, client_id)
     }
 }
 
-fn run_edit_session(session: &EditSessionImpl, client_id: u32) -> Result<()> {
+fn run_edit_session(session: EditSessionImpl, client_id: u32) -> Result<()> {
     let context = session.context.clone();
     let iface: ITfEditSession = session_as_interface(session);
     let hr: HRESULT = unsafe { context.RequestEditSession(client_id, &iface, TF_ES_SYNC | TF_ES_READWRITE)? };
@@ -277,8 +277,8 @@ fn run_edit_session(session: &EditSessionImpl, client_id: u32) -> Result<()> {
     Ok(())
 }
 
-fn session_as_interface(session: &EditSessionImpl) -> ITfEditSession {
-    session.clone().into()
+fn session_as_interface(session: EditSessionImpl) -> ITfEditSession {
+    session.into()
 }
 
 impl ITfTextInputProcessor_Impl for ZtapTextService_Impl {
@@ -296,12 +296,11 @@ impl ITfTextInputProcessor_Impl for ZtapTextService_Impl {
 
         let keystroke_mgr: ITfKeystrokeMgr = thread_mgr.cast()?;
 
-        let this_as_sink: ITfKeyEventSink = self
-            .cast()
-            .expect("TODO: verify self.cast::<ITfKeyEventSink>() is valid inside an _Impl method on a real windows-rs build");
+        let this_as_processor: ITfTextInputProcessor = self.cast()?;
+        let this_as_sink: ITfKeyEventSink = this_as_processor.cast()?;
 
         unsafe {
-            keystroke_mgr.AdviseKeyEventSink(client_id, &this_as_sink, BOOL(1))?;
+            keystroke_mgr.AdviseKeyEventSink(client_id, &this_as_sink, true)?;
         }
 
         let mut state = self.state.borrow_mut();

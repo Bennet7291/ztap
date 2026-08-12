@@ -2,7 +2,7 @@ pub mod candidate_window;
 pub mod input_method;
 
 use objc2::rc::Retained;
-use objc2::{MainThreadMarker};
+use objc2::{AnyThread, MainThreadMarker};
 use objc2_app_kit::NSApplication;
 use objc2_foundation::{NSBundle, NSString};
 use objc2_input_method_kit::IMKServer;
