@@ -58,7 +58,7 @@
 use std::cell::RefCell;
 
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
+use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2::{define_class, msg_send, AnyThread, ClassType, DefinedClass};
 use objc2_foundation::{NSArray, NSInteger, NSRange, NSRect, NSString, NSUInteger};
 use objc2_input_method_kit::{IMKInputController, NSObjectIMKServerInput};
@@ -111,10 +111,25 @@ define_class!(
     //   cleans up via ordinary Rust drop glue when the Objective-C object is
     //   deallocated, which is sound for the same reason any Rust struct's
     //   fields drop normally.
-    #[unsafe(super(IMKInputController))]
+    // CI-CONFIRMED FIX: `#[unsafe(super = IMKInputController)]` (with
+    // `=`), not `#[unsafe(super(IMKInputController))]` (with parens) --
+    // same fix as candidate_window.rs's CandidateView; see that file for
+    // the confirming examples. The `(...)` form does not exist in
+    // define_class!'s actual grammar.
+    #[unsafe(super = IMKInputController)]
     #[name = "ZtapInputController"]
     #[ivars = Ivars]
     struct ZtapInputController;
+
+    // Required on every define_class! type regardless of superclass --
+    // see candidate_window.rs's CandidateView for the confirming examples
+    // (every real define_class! usage found implements this, even when
+    // empty). Missing this was an omission in the original draft, not
+    // something CI's first error round caught (candidate_window.rs's
+    // syntax error was fatal enough that CI likely never reached
+    // typechecking this file), so it's fixed proactively here rather than
+    // waiting for a further round-trip.
+    unsafe impl NSObjectProtocol for ZtapInputController {}
 
     // NSObjectIMKServerInput is an "informal protocol" (a category on
     // NSObject providing default no-op implementations) rather than a
