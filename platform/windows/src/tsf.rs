@@ -73,7 +73,12 @@ use windows::Win32::UI::TextServices::{
 // windows-core 0.62 moved BOOL here (it is no longer re-exported at
 // windows::Win32::Foundation::BOOL) -- see Cargo.toml's fix-history note 2
 // for why windows_core is a direct dependency of this crate at all.
-use windows_core::{BOOL, Ref};
+// `Interface` (the trait providing `.cast::<T>()` on every COM interface
+// type) also needs to be imported explicitly -- CI confirmed `.cast()`
+// calls throughout this file don't resolve without it in scope, even
+// though the method exists on the type (it's a trait method, and Rust
+// requires the trait itself to be imported, not just implemented).
+use windows_core::{Interface, BOOL, Ref};
 
 use ztap_core::{Dictionary, Entry, InputSession, LearningStore};
 
@@ -379,7 +384,7 @@ impl ZtapTextService {
             }
             Ok(())
         });
-        run_edit_session(&session, client_id)?;
+        run_edit_session(session, client_id)?;
 
         self.end_composition(context)?;
         Ok(())
@@ -430,7 +435,7 @@ impl ZtapTextService {
             // is added.
             Ok(())
         });
-        run_edit_session(&session, client_id)
+        run_edit_session(session, client_id)
     }
 
     /// Start a new composition anchored at the current selection. Populates
@@ -464,7 +469,7 @@ impl ZtapTextService {
             }
             Ok(())
         });
-        run_edit_session(&session, client_id)?;
+        run_edit_session(session, client_id)?;
 
         let Some(composition) = created.borrow_mut().take() else {
             return Err(E_FAIL.into());
@@ -488,7 +493,7 @@ impl ZtapTextService {
             // "never borrow &self across the callback" rule as elsewhere.
             unsafe { comp_state.composition.EndComposition(cookie) }
         });
-        run_edit_session(&session, client_id)
+        run_edit_session(session, client_id)
     }
 }
 
@@ -500,32 +505,32 @@ impl ZtapTextService {
 /// the UI thread, and TF_ES_SYNC is what makes DoEditSession execute
 /// before RequestEditSession returns (which every closure above relies on
 /// for its captured state to still be meaningful when the call returns).
-fn run_edit_session(session: &EditSessionImpl, client_id: u32) -> Result<()> {
+///
+/// Takes `session` by value (not `&EditSessionImpl`) so the
+/// `EditSessionImpl -> ITfEditSession` conversion (`#[implement]`'s
+/// generated `From<EditSessionImpl> for ITfEditSession` impl) applies
+/// directly via `.into()`, with no ambiguity between "clone the COM
+/// object" and "clone the reference" for the compiler to get wrong --
+/// CI's own error showed the previous `&EditSessionImpl`-based version
+/// resolving `.clone()` against the reference itself rather than the
+/// underlying object, since `EditSessionImpl` has no `#[derive(Clone)]`
+/// of its own (COM refcount-clone semantics come from `#[implement]`,
+/// which apparently doesn't extend to being reachable through a plain
+/// `&` the way this draft assumed). Every call site already constructs a
+/// fresh, single-use `EditSessionImpl` immediately before calling this
+/// function, so taking ownership here costs nothing.
+fn run_edit_session(session: EditSessionImpl, client_id: u32) -> Result<()> {
     let context = session.context.clone();
-    let iface: ITfEditSession = session_as_interface(session);
-    // SAFETY: `iface` is a fully-constructed ITfEditSession wrapping
-    // `session`; RequestEditSession's documented contract is that with
-    // TF_ES_SYNC set it synchronously invokes DoEditSession before
+    let iface: ITfEditSession = session.into();
+    // SAFETY: `iface` is a fully-constructed ITfEditSession wrapping the
+    // session object; RequestEditSession's documented contract is that
+    // with TF_ES_SYNC set it synchronously invokes DoEditSession before
     // returning.
     let hr: HRESULT = unsafe { context.RequestEditSession(client_id, &iface, TF_ES_SYNC | TF_ES_READWRITE)? };
     if hr.is_err() {
         return Err(hr.into());
     }
     Ok(())
-}
-
-/// windows-rs's #[implement] macro produces a distinct generated type
-/// (conventionally EditSessionImpl here, with the _Impl suffix reserved
-/// for the trait-impl target) implementing Into<ITfEditSession> /
-/// From<EditSessionImpl>. This helper exists purely so run_edit_session
-/// above reads clearly; on an actual Windows build this should reduce to
-/// `session.into()` or an equivalent windows-rs-generated conversion --
-/// **verify against the real generated API** rather than assuming this
-/// exact helper signature compiles as written, since the precise
-/// conversion path #[implement] generates is one of the details this
-/// draft could not check against a compiler.
-fn session_as_interface(session: &EditSessionImpl) -> ITfEditSession {
-    session.clone().into()
 }
 
 // -- ITfTextInputProcessor ---------------------------------------------
