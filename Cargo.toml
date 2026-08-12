@@ -1,74 +1,15 @@
-[package]
-name    = "ztap-windows"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+[workspace]
+members = ["core", "platform/windows", "platform/macos"]
+resolver = "2"
 
-[dependencies]
-ztap-core = { path = "../../core" }
-
-# UNTESTED-turned-REAL-CI-FEEDBACK: this crate could not be compiled in the
-# environment it was originally written in (no Windows toolchain/SDK
-# available -- see tsf.rs's module doc comment). The notes below reflect
-# fixes applied in response to actual `cargo build` errors from CI, not
-# speculation -- treat this feature list and the windows-core dependency
-# as verified against a real windows-rs 0.62.2 resolve, but the crate as a
-# whole should still be treated as unverified until CI reports a full,
-# clean build.
-#
-# Fix history:
-#   1. "implement" is NOT a Cargo feature on windows-rs 0.62 -- the
-#      #[implement] macro is available unconditionally via windows::core,
-#      so it was removed from the feature list (see prior commit).
-#   2. The #[implement] macro's *generated code* refers to the crate
-#      literally by the name `windows_core` (not `windows::core`) --
-#      confirmed by the CI error "cannot find `windows_core` in the crate
-#      root" pointing directly at every #[implement(...)] call site. This
-#      means `windows-core` must be a *direct* dependency of this crate
-#      (not just reached through `windows::core::`), so the bare
-#      identifier `windows_core` resolves at the crate root. Added below.
-#   3. `Win32_UI_Input` (for Win32::UI::Input::KeyboardAndMouse's VK_*
-#      constants in tsf.rs) and `Win32_Security` (required by
-#      Win32_System_Registry's RegCreateKeyExW) were missing from the
-#      feature list; added below. The original draft also pulled in the
-#      WinRT `Foundation` feature for `windows::Foundation::Numerics::
-#      Matrix3x2` in candidate_window.rs -- that was a genuine type
-#      mistake (not just a missing feature): D2D1_BRUSH_PROPERTIES.transform
-#      wants the Win32 Direct2D `D2D1_MATRIX_3X2_F`, not the WinRT numerics
-#      type. Fixed in candidate_window.rs by building the identity matrix
-#      by hand from D2D1_MATRIX_3X2_F directly, so `Foundation` is not
-#      needed and is omitted here.
-windows = { version = "0.62", features = [
-    # TSF (Text Services Framework) COM interfaces
-    "Win32_UI_TextServices",
-    # COM plumbing TSF's interfaces are built on (IUnknown, CoCreateInstance, ...)
-    "Win32_System_Com",
-    "Win32_System_Ole",
-    # Win32 fundamentals: HRESULT, error types, HWND, POINT, RECT, ...
-    "Win32_Foundation",
-    # Registry access for DllRegisterServer / DllUnregisterServer;
-    # Win32_Security is required transitively by RegCreateKeyExW's signature.
-    "Win32_System_Registry",
-    "Win32_Security",
-    # LoadLibrary/GetProcAddress-adjacent + module handle for DllMain
-    "Win32_System_LibraryLoader",
-    "Win32_System_SystemServices",
-    # Candidate window: native Win32 window + message loop
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_Graphics_Gdi",
-    # Virtual-key constants (VK_BACK, VK_RETURN, ...) used by tsf.rs's key routing
-    "Win32_UI_Input",
-    # Candidate window rendering: Direct2D + DirectWrite (see candidate_window.rs)
-    "Win32_Graphics_Direct2D",
-    "Win32_Graphics_Direct2D_Common",
-    "Win32_Graphics_DirectWrite",
-    "Win32_Graphics_Dxgi_Common",
-    # %APPDATA%\Ztap path resolution for the user dictionary / learning store
-    "Win32_UI_Shell",
-    "Win32_System_Com_StructuredStorage",
-] }
-
-windows-core = "0.62"
-
-[lib]
-crate-type = ["cdylib"]   # Windows IME is loaded as a DLL
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors  = ["Ztap Contributors"]
+# GPL-3.0-only, not MIT: the bundled built-in dictionary (core/dict/ztap.dict.txt)
+# merges data from rime-ice (https://github.com/iDvel/rime-ice), which is
+# GPL-3.0-only. That data is compiled directly into the ztap-core binary via
+# build.rs + include_bytes!, so the combined work is GPL-3.0-only throughout
+# the workspace. See core/dict/README.md for full provenance and the
+# per-source license breakdown.
+license  = "GPL-3.0-only"
