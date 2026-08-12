@@ -72,7 +72,7 @@ jobs:
       # Windows DLL/exe
       - name: Package Windows
         if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: pwsh
+        shell: bash
         run: |
           mkdir dist
 
