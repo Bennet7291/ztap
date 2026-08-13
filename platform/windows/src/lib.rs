@@ -1,5 +1,7 @@
 use std::cell::RefCell;
 
+mod tsf;
+
 use windows::core::{implement, Result, GUID, HRESULT};
 use windows::Win32::Foundation::{E_FAIL, LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
