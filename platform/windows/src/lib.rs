@@ -5,7 +5,8 @@ mod tsf;
 use windows::core::{implement, Result, GUID, HRESULT};
 use windows::Win32::Foundation::{E_FAIL, LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_BACK, VK_ESCAPE, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SPACE,
+    GetKeyState, MapVirtualKeyW, MAPVK_VK_TO_CHAR, VK_BACK, VK_CONTROL, VK_ESCAPE, VK_MENU,
+    VK_NEXT, VK_PRIOR, VK_RETURN, VK_SPACE,
 };
 use windows::Win32::UI::TextServices::{
     ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext,
@@ -81,16 +82,22 @@ impl ZtapTextService {
     pub fn on_key_down(&self, context: &ITfContext, vkey: u32) -> Result<bool> {
         let vk = vkey as u16;
 
+        let ctrl_down = unsafe { (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 };
+        let alt_down = unsafe { (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0 };
+        if ctrl_down || alt_down {
+            return Ok(false);
+        }
+
         let has_composition = {
             let state = self.state.borrow();
             state.session.as_ref().map(|s| !s.preedit.is_empty()).unwrap_or(false)
         };
 
-        if (b'a' as u16..=b'z' as u16).contains(&vk) {
+        if (b'A' as u16..=b'Z' as u16).contains(&vk) {
             let candidates = {
                 let mut state = self.state.borrow_mut();
                 let Some(session) = state.session.as_mut() else { return Ok(false) };
-                let ch = (vk as u8) as char;
+                let ch = (vk as u8 as char).to_ascii_lowercase();
                 session.push_char(ch)
             };
             self.refresh_composition(context, &candidates)?;
@@ -165,7 +172,7 @@ impl ZtapTextService {
         }
 
         if !has_composition {
-            if let Some(ch) = char::from_u32(vkey) {
+            if let Some(ch) = char_for_vk(vk) {
                 if ch.is_ascii_punctuation() {
                     let mapped = {
                         let mut state = self.state.borrow_mut();
@@ -278,6 +285,15 @@ impl ZtapTextService {
     }
 }
 
+fn char_for_vk(vk: u16) -> Option<char> {
+    let mapped = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_CHAR) };
+    if mapped == 0 {
+        return None;
+    }
+    let code = mapped & 0x7FFF_FFFF;
+    char::from_u32(code)
+}
+
 fn run_edit_session(session: EditSessionImpl, client_id: u32) -> Result<()> {
     let context = session.context.clone();
     let iface: ITfEditSession = session.into();
@@ -351,6 +367,13 @@ impl ITfKeyEventSink_Impl for ZtapTextService_Impl {
     fn OnTestKeyDown(&self, pic: Ref<'_, ITfContext>, wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
         let Some(_context) = pic.as_ref() else { return Ok(BOOL(0)) };
         let vk = wparam.0 as u16;
+
+        let ctrl_down = unsafe { (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 };
+        let alt_down = unsafe { (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0 };
+        if ctrl_down || alt_down {
+            return Ok(BOOL(0));
+        }
+
         let has_composition = self
             .state
             .borrow()
@@ -359,7 +382,7 @@ impl ITfKeyEventSink_Impl for ZtapTextService_Impl {
             .map(|s| !s.preedit.is_empty())
             .unwrap_or(false);
 
-        let maybe_consumed = (b'a' as u16..=b'z' as u16).contains(&vk)
+        let maybe_consumed = (b'A' as u16..=b'Z' as u16).contains(&vk)
             || (has_composition
                 && matches!(vk, v if v == VK_BACK.0 || v == VK_RETURN.0 || v == VK_ESCAPE.0 || v == VK_SPACE.0))
             || (has_composition && (b'1' as u16..=b'9' as u16).contains(&vk));
