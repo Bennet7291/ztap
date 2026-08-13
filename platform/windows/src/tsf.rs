@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows::core::{implement, Error, IUnknown, Result, GUID, PCWSTR};
 use windows::Win32::Foundation::{
-    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_NOINTERFACE, HMODULE, MAX_PATH,
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_FAIL, E_NOINTERFACE, HMODULE, MAX_PATH,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, IClassFactory, IClassFactory_Impl, CLSCTX_INPROC_SERVER,
@@ -47,7 +47,7 @@ fn dll_path() -> Result<Vec<u16>> {
     loop {
         let len = unsafe { GetModuleFileNameW(Some(handle), &mut buf) };
         if len == 0 {
-            return Err(Error::from_win32());
+            return Err(Error::new(E_FAIL, "GetModuleFileNameW failed"));
         }
         if (len as usize) < buf.len() {
             buf.truncate(len as usize);
@@ -85,7 +85,7 @@ fn write_reg_sz(root: HKEY, subkey: &str, value_name: Option<&str>, data: &str) 
         RegCreateKeyExW(
             root,
             PCWSTR(subkey_wide.as_ptr()),
-            0,
+            Some(0),
             PCWSTR::null(),
             REG_OPTION_NON_VOLATILE,
             KEY_WRITE,
@@ -106,7 +106,7 @@ fn write_reg_sz(root: HKEY, subkey: &str, value_name: Option<&str>, data: &str) 
         None => PCWSTR::null(),
     };
 
-    let result = unsafe { RegSetValueExW(hkey, value_ptr, 0, REG_SZ, Some(data_bytes)) };
+    let result = unsafe { RegSetValueExW(hkey, value_ptr, Some(0), REG_SZ, Some(data_bytes)) };
 
     unsafe {
         let _ = RegCloseKey(hkey);
@@ -157,17 +157,16 @@ fn register_tsf_profile() -> Result<()> {
             CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)?;
         profiles.Register(&CLSID_ZTAP_TEXT_SERVICE)?;
 
-        let description = wide("Ztap 拼音输入法");
-        let icon_path = dll_path()?;
+        let description: Vec<u16> = "Ztap 拼音输入法".encode_utf16().collect();
+        let icon_path_nul = dll_path()?;
+        let icon_path: Vec<u16> = icon_path_nul[..icon_path_nul.len().saturating_sub(1)].to_vec();
 
         profiles.AddLanguageProfile(
             &CLSID_ZTAP_TEXT_SERVICE,
             LANGID_ZH_CN,
             &GUID_ZTAP_PROFILE,
-            PCWSTR(description.as_ptr()),
-            (description.len() as u32).saturating_sub(1),
-            PCWSTR(icon_path.as_ptr()),
-            (icon_path.len() as u32).saturating_sub(1),
+            &description,
+            &icon_path,
             0,
         )?;
     }
@@ -265,8 +264,5 @@ pub unsafe extern "system" fn DllGetClassObject(
     }
 
     let factory: IClassFactory = ZtapClassFactory.into();
-    match factory.query(unsafe { &*riid }, ppv) {
-        Ok(()) => windows_core::HRESULT(0),
-        Err(e) => e.code(),
-    }
+    factory.query(unsafe { &*riid }, ppv)
 }
