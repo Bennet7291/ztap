@@ -42,6 +42,7 @@ impl CandidateWindow {
             ]
         };
 
+        unsafe {
             let _: () = msg_send![&panel, setOpaque: false];
             let clear = NSColor::clearColor();
             let _: () = msg_send![&panel, setBackgroundColor: &*clear];
@@ -51,12 +52,17 @@ impl CandidateWindow {
                 setCollectionBehavior: NSWindowCollectionBehavior::CanJoinAllSpaces,
             ];
             let _: () = msg_send![&panel, setBecomesKeyOnlyIfNeeded: true];
+        }
 
         let preedit_label = make_label(mtm, PREEDIT_FONT_SIZE, 0.4, 0.4, 0.4);
+        unsafe {
             let _: () = msg_send![&preedit_label, setHidden: true];
+        }
 
         let content_view = panel.contentView().expect("NSPanel must have a content view");
+        unsafe {
             content_view.addSubview(&preedit_label);
+        }
 
         Ok(CandidateWindow {
             panel,
@@ -81,21 +87,29 @@ impl CandidateWindow {
         }
 
         let new_frame = NSRect::new(origin, NSSize::new(width, height));
+        unsafe {
             let _: () = msg_send![&self.panel, setFrame: new_frame, display: true];
+        }
 
         let mut y_from_top = PADDING;
 
         if !preedit.is_empty() {
+            unsafe {
                 self.preedit_label.setStringValue(&NSString::from_str(preedit));
                 let _: () = msg_send![&self.preedit_label, setHidden: false];
+            }
             let label_y = height - y_from_top - PREEDIT_ROW_HEIGHT;
+            unsafe {
                 self.preedit_label.setFrame(NSRect::new(
                     NSPoint::new(PADDING, label_y),
                     NSSize::new(width - PADDING * 2.0, PREEDIT_ROW_HEIGHT),
                 ));
+            }
             y_from_top += PREEDIT_ROW_HEIGHT;
         } else {
+            unsafe {
                 let _: () = msg_send![&self.preedit_label, setHidden: true];
+            }
         }
 
         self.ensure_row_count(candidates.len(), &content_view);
@@ -105,10 +119,13 @@ impl CandidateWindow {
             let row_y = height - y_from_top - ROW_HEIGHT;
 
             let index_text = format!("{}", (i + 1) % 10);
+            unsafe {
                 row.index_label.setStringValue(&NSString::from_str(&index_text));
                 row.word_label.setStringValue(&NSString::from_str(candidate));
                 let _: () = msg_send![&row.index_label, setHidden: false];
                 let _: () = msg_send![&row.word_label, setHidden: false];
+            }
+            unsafe {
                 row.index_label.setFrame(NSRect::new(
                     NSPoint::new(PADDING, row_y),
                     NSSize::new(INDEX_COLUMN_WIDTH, ROW_HEIGHT),
@@ -117,24 +134,33 @@ impl CandidateWindow {
                     NSPoint::new(PADDING + INDEX_COLUMN_WIDTH, row_y),
                     NSSize::new(width - PADDING * 2.0 - INDEX_COLUMN_WIDTH, ROW_HEIGHT),
                 ));
+            }
 
             let (r, g, b) = if i == highlighted { (0.05, 0.05, 0.4) } else { (0.1, 0.1, 0.1) };
+            unsafe {
                 let color = NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0);
                 row.word_label.setTextColor(Some(&color));
+            }
 
             y_from_top += ROW_HEIGHT;
         }
         for row in rows.iter().skip(candidates.len()) {
+            unsafe {
                 let _: () = msg_send![&row.index_label, setHidden: true];
                 let _: () = msg_send![&row.word_label, setHidden: true];
+            }
         }
         drop(rows);
 
+        unsafe {
             let _: () = msg_send![&self.panel, orderFront: std::ptr::null::<objc2::runtime::AnyObject>()];
+        }
     }
 
     pub fn hide(&self) {
+        unsafe {
             let _: () = msg_send![&self.panel, orderOut: std::ptr::null::<objc2::runtime::AnyObject>()];
+        }
     }
 
     fn ensure_row_count(&self, count: usize, content_view: &Retained<NSView>) {
@@ -142,8 +168,10 @@ impl CandidateWindow {
         while rows.len() < count {
             let index_label = make_label(self.mtm, INDEX_FONT_SIZE, 0.55, 0.55, 0.55);
             let word_label = make_label(self.mtm, CANDIDATE_FONT_SIZE, 0.1, 0.1, 0.1);
+            unsafe {
                 content_view.addSubview(&index_label);
                 content_view.addSubview(&word_label);
+            }
             rows.push(Row { index_label, word_label });
         }
     }
@@ -171,11 +199,13 @@ impl CandidateWindow {
 
 fn make_label(mtm: MainThreadMarker, font_size: f64, r: f64, g: f64, b: f64) -> Retained<NSTextField> {
     let label = NSTextField::labelWithString(ns_string!(""), mtm);
+    unsafe {
         let color = NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0);
         label.setTextColor(Some(&color));
         label.setAlignment(NSTextAlignment::Left);
         let font = NSFont::systemFontOfSize(font_size);
         label.setFont(Some(&font));
         let _: () = msg_send![&label, setHidden: true];
+    }
     label
 }

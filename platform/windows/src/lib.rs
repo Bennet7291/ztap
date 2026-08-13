@@ -38,6 +38,7 @@ struct ServiceState {
     key_event_sink_advised: bool,
     session: Option<InputSession>,
     composition: Option<CompositionState>,
+    self_as_sink: Option<ITfKeyEventSink>,
 }
 
 impl ZtapTextService {
@@ -49,8 +50,16 @@ impl ZtapTextService {
                 key_event_sink_advised: false,
                 session: None,
                 composition: None,
+                self_as_sink: None,
             }),
         }
+    }
+
+    pub fn create() -> (ITfTextInputProcessor, ITfKeyEventSink) {
+        let svc = ZtapTextService::new();
+        let processor: ITfTextInputProcessor = svc.into();
+        let sink: ITfKeyEventSink = processor.cast().expect("ZtapTextService implements ITfKeyEventSink");
+        (processor, sink)
     }
 
     fn learning_store_path() -> std::path::PathBuf {
@@ -269,16 +278,14 @@ impl ZtapTextService {
 
 fn run_edit_session(session: EditSessionImpl, client_id: u32) -> Result<()> {
     let context = session.context.clone();
-    let iface: ITfEditSession = session_as_interface(session);
-    let hr: HRESULT = unsafe { context.RequestEditSession(client_id, &iface, TF_ES_SYNC | TF_ES_READWRITE)? };
+    let iface: ITfEditSession = session.into();
+    let hr: HRESULT = unsafe {
+        context.RequestEditSession(client_id, &iface, TF_ES_SYNC | TF_ES_READWRITE)?
+    };
     if hr.is_err() {
         return Err(hr.into());
     }
     Ok(())
-}
-
-fn session_as_interface(session: EditSessionImpl) -> ITfEditSession {
-    session.into()
 }
 
 impl ITfTextInputProcessor_Impl for ZtapTextService_Impl {
@@ -296,8 +303,11 @@ impl ITfTextInputProcessor_Impl for ZtapTextService_Impl {
 
         let keystroke_mgr: ITfKeystrokeMgr = thread_mgr.cast()?;
 
-        let this_as_processor: ITfTextInputProcessor = self.cast()?;
-        let this_as_sink: ITfKeyEventSink = this_as_processor.cast()?;
+        let sink = self.state.borrow_mut().self_as_sink.take();
+        let this_as_sink = match sink {
+            Some(s) => s,
+            None => return Err(E_FAIL.into()),
+        };
 
         unsafe {
             keystroke_mgr.AdviseKeyEventSink(client_id, &this_as_sink, true)?;
@@ -308,6 +318,7 @@ impl ITfTextInputProcessor_Impl for ZtapTextService_Impl {
         state.client_id = client_id;
         state.key_event_sink_advised = true;
         state.session = Some(session);
+        state.self_as_sink = Some(this_as_sink);
 
         Ok(())
     }
